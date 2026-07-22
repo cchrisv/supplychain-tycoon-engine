@@ -2492,6 +2492,13 @@ static void PlaceObject()
 }
 
 
+#ifdef __EMSCRIPTEN__
+/* Defined in os/emscripten/sct_bridge.cpp. When false (the default for the
+ * ModernTTD fork) idle viewport clicks never open the engine's own windows —
+ * the React layer resolves the tile via sct_tile_info and shows its UI. */
+extern bool _sct_native_viewport_windows;
+#endif
+
 bool HandleViewportClicked(const Viewport &vp, int x, int y)
 {
 	const Vehicle *v = CheckClickOnVehicle(vp, x, y);
@@ -2505,6 +2512,11 @@ bool HandleViewportClicked(const Viewport &vp, int x, int y)
 		PlaceObject();
 		return true;
 	}
+
+#ifdef __EMSCRIPTEN__
+	/* React owns idle clicks: no native sign/landscape/vehicle windows. */
+	if (!_sct_native_viewport_windows) return false;
+#endif
 
 	if (CheckClickOnViewportSign(vp, x, y)) return true;
 	bool result = CheckClickOnLandscape(vp, x, y);

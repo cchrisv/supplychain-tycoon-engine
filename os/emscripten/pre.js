@@ -27,6 +27,7 @@ Module.sct = (function() {
     var _scrollToTile = null;
     var _tileInfo = null;
     var _renameStation = null;
+    var _setNativeClick = null;
     return {
         exec: function(cmd) {
             if (!_exec) _exec = Module.cwrap('sct_console_exec', null, ['string']);
@@ -125,6 +126,10 @@ Module.sct = (function() {
         renameStation: function(stationId, name) {
             if (!_renameStation) _renameStation = Module.cwrap('sct_rename_station', 'string', ['number', 'string']);
             return JSON.parse(_renameStation(stationId|0, name == null ? '' : String(name)));
+        },
+        setNativeClick: function(on) {
+            if (!_setNativeClick) _setNativeClick = Module.cwrap('sct_set_native_click', null, ['number']);
+            return _setNativeClick(on ? 1 : 0);
         },
     };
 })();

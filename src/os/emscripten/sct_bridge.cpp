@@ -73,7 +73,15 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <strings.h>
 #include <tuple>
+
+/* When false (the fork default), idle viewport clicks never open the engine's
+ * own windows (station/town/industry/vehicle views) — the React layer routes
+ * clicks via sct_tile_info instead. Checked in HandleViewportClicked
+ * (viewport.cpp); toggleable at runtime through sct_set_native_click below
+ * for debugging against stock behaviour. */
+bool _sct_native_viewport_windows = false;
 
 extern "C" {
 
@@ -1536,11 +1544,21 @@ const char *EMSCRIPTEN_KEEPALIVE sct_rename_station(int station_id, const char *
 void EMSCRIPTEN_KEEPALIVE sct_set_build_param(const char *key, int value)
 {
 	if (key == nullptr) return;
-	if (std::strcmp(key, "railtype") == 0) {
+	/* Case-insensitive: the JS side sends camelCase ("railType"). */
+	if (strcasecmp(key, "railtype") == 0) {
 		g_sct_railtype = value;
-	} else if (std::strcmp(key, "roadtype") == 0) {
+	} else if (strcasecmp(key, "roadtype") == 0) {
 		g_sct_roadtype = value;
 	}
+}
+
+/**
+ * Debug toggle: re-enable the engine's own viewport-click windows
+ * (station/town/industry/vehicle views). Off by default in this fork.
+ */
+void EMSCRIPTEN_KEEPALIVE sct_set_native_click(int on)
+{
+	_sct_native_viewport_windows = on != 0;
 }
 
 } /* extern "C" */

@@ -35,6 +35,12 @@ public:
 
 	bool ClaimMousePointer() override;
 
+#ifdef __EMSCRIPTEN__
+	/* The browser already shows the OS cursor over the canvas; drawing the
+	 * software cursor sprite as well produces a double cursor. */
+	bool UseSystemCursor() override { return true; }
+#endif
+
 	void EditBoxGainedFocus() override;
 
 	void EditBoxLostFocus() override;
