@@ -13,6 +13,7 @@ Module.sct = (function() {
     var _buildVehicle = null;
     var _vehicleCmd = null;
     var _setBuildParam = null;
+    var _addOrder = null;
     return {
         exec: function(cmd) {
             if (!_exec) _exec = Module.cwrap('sct_console_exec', null, ['string']);
@@ -53,6 +54,10 @@ Module.sct = (function() {
         setBuildParam: function(key, value) {
             if (!_setBuildParam) _setBuildParam = Module.cwrap('sct_set_build_param', null, ['string', 'number']);
             return _setBuildParam(key, value|0);
+        },
+        addOrder: function(vehicleId, kind, destId) {
+            if (!_addOrder) _addOrder = Module.cwrap('sct_add_order', 'string', ['number', 'string', 'number']);
+            return JSON.parse(_addOrder(vehicleId|0, kind, destId|0));
         },
     };
 })();

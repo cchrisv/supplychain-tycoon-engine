@@ -37,6 +37,7 @@
 #include "../../road_cmd.h"
 #include "../../station_cmd.h"
 #include "../../vehicle_cmd.h"
+#include "../../order_cmd.h"
 #include "../../landscape_cmd.h"
 #include "../../terraform_cmd.h"
 #include "../../newgrf_station.h"
@@ -581,9 +582,16 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 	}
 
 	if (std::strcmp(action, "signal") == 0) {
-		/* No CMD_BUILD_SIGNALS in 15.3; CMD_BUILD_SINGLE_SIGNAL / CMD_BUILD_SIGNAL_TRACK
-		 * (rail_cmd.h:24,27) need many SignalType/variant args. Stub for now. */
-		return dump({{"ok", false}, {"error", "signals pending"}, {"cost", 0}});
+		/* rail_cmd.h:24 CmdBuildSingleSignal(tile, track, sigtype, sigvar, convert, skip, ctrl, cycle_start, cycle_stop, num_dir_cycle, signals_copy) */
+		const Track track = (p1 >= TRACK_BEGIN && p1 < TRACK_END) ? static_cast<Track>(p1) : TRACK_X;
+		const SignalType sigtype = (p2 >= SIGTYPE_BLOCK && p2 <= SIGTYPE_LAST)
+				? static_cast<SignalType>(p2) : SIGTYPE_BLOCK;
+		CommandCost cost = Command<CMD_BUILD_SINGLE_SIGNAL>::Do(
+				DoCommandFlag::Execute, tile_a, track, sigtype, SIG_ELECTRIC,
+				false, false, false,
+				static_cast<SignalType>(0), static_cast<SignalType>(0),
+				static_cast<uint8_t>(1), static_cast<uint8_t>(0));
+		return dump(SctCostResult(cost));
 	}
 
 	if (std::strcmp(action, "road") == 0) {
@@ -763,6 +771,50 @@ const char *EMSCRIPTEN_KEEPALIVE sct_vehicle_cmd(int vehicle_id, const char *act
 	}
 
 	return dump({{"ok", false}, {"error", "unknown action"}});
+}
+
+/**
+ * Append a goto-station or goto-depot order to a vehicle's order list.
+ * order_cmd.h:20 CmdInsertOrder; order_base.h:76 MakeGoToStation, :77 MakeGoToDepot.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_add_order(int vehicle_id, const char *kind, int dest_id)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (kind == nullptr) {
+		return dump({{"ok", false}, {"error", "unknown kind"}});
+	}
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	const Vehicle *v = Vehicle::GetIfValid(vehicle_id);
+	if (v == nullptr) {
+		return dump({{"ok", false}, {"error", "no vehicle"}});
+	}
+
+	Order o{};
+	if (std::strcmp(kind, "station") == 0) {
+		o.MakeGoToStation(StationID{static_cast<uint16_t>(dest_id)});
+	} else if (std::strcmp(kind, "depot") == 0) {
+		/* order_type.h: OrderDepotTypeFlag::PartOfOrders (replaces legacy ODTFB_PART_OF_ORDERS) */
+		o.MakeGoToDepot(DestinationID{static_cast<size_t>(dest_id)}, OrderDepotTypeFlag::PartOfOrders);
+	} else {
+		return dump({{"ok", false}, {"error", "unknown kind"}});
+	}
+
+	/* Append: sel_ord == current order count (vehicle_base.h:705 GetNumOrders). */
+	const VehicleOrderID sel_ord = v->GetNumOrders();
+	CommandCost cost = Command<CMD_INSERT_ORDER>::Do(
+			DoCommandFlag::Execute, v->tile, VehicleID{static_cast<uint32_t>(vehicle_id)}, sel_ord, o);
+	return dump(SctOkResult(cost));
 }
 
 /**
