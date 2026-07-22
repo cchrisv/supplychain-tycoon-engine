@@ -7,6 +7,7 @@ Module.sct = (function() {
     var _getState = null;
     var _setFastForward = null;
     var _returnToMenu = null;
+    var _query = null;
     return {
         exec: function(cmd) {
             if (!_exec) _exec = Module.cwrap('sct_console_exec', null, ['string']);
@@ -23,6 +24,10 @@ Module.sct = (function() {
         returnToMenu: function() {
             if (!_returnToMenu) _returnToMenu = Module.cwrap('sct_return_to_menu', null, []);
             return _returnToMenu();
+        },
+        query: function(kind) {
+            if (!_query) _query = Module.cwrap('sct_query', 'string', ['string']);
+            return JSON.parse(_query(kind));
         },
     };
 })();

@@ -366,7 +366,7 @@ if(EMSCRIPTEN)
     add_definitions(-s DISABLE_EXCEPTION_CATCHING=0)
 
     # Export functions to Javascript.
-    target_link_libraries(WASM::WASM INTERFACE "-s EXPORTED_FUNCTIONS='[\"_main\", \"_em_openttd_add_server\", \"_sct_console_exec\", \"_sct_get_state\", \"_sct_set_fast_forward\", \"_sct_return_to_menu\"]' -s EXPORTED_RUNTIME_METHODS='[\"cwrap\"]'")
+    target_link_libraries(WASM::WASM INTERFACE "-s EXPORTED_FUNCTIONS='[\"_main\", \"_em_openttd_add_server\", \"_sct_console_exec\", \"_sct_get_state\", \"_sct_set_fast_forward\", \"_sct_return_to_menu\", \"_sct_query\"]' -s EXPORTED_RUNTIME_METHODS='[\"cwrap\"]'")
 
     # Preload all the files we generate during build.
     # As we do not compile with FreeType / FontConfig, we also have no way to
