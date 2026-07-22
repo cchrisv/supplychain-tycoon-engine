@@ -24,6 +24,7 @@
 #include "../../station_base.h"
 #include "../../vehicle_base.h"
 #include "../../group.h"
+#include "../../group_cmd.h"
 #include "../../engine_base.h"
 #include "../../engine_func.h"
 #include "../../news_gui.h"
@@ -1029,6 +1030,198 @@ const char *EMSCRIPTEN_KEEPALIVE sct_vehicle_orders(int vehicle_id)
 
 	buffer = arr.dump();
 	return buffer.c_str();
+}
+
+/**
+ * Wave 8 — fleet management.
+ * Clone a vehicle into a depot. share_orders != 0 shares the source's order
+ * list (the OpenTTD idiom for "add another vehicle to this route"); otherwise
+ * the orders are copied. vehicle_cmd.h:26 CmdCloneVehicle.
+ * @return {ok, error, id, cost}; id is the new vehicle, -1 on failure.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_clone_vehicle(int depot_tile, int vehicle_id, int share_orders)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}, {"id", -1}, {"cost", 0}});
+	}
+
+	const VehicleID vid{static_cast<uint32_t>(vehicle_id)};
+	if (!Vehicle::IsValidID(vid)) {
+		return dump({{"ok", false}, {"error", "invalid vehicle"}, {"id", -1}, {"cost", 0}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	auto result = Command<CMD_CLONE_VEHICLE>::Do(
+			DoCommandFlag::Execute,
+			TileIndex{static_cast<uint32_t>(depot_tile)},
+			vid,
+			share_orders != 0);
+	const CommandCost &cost = std::get<0>(result);
+	const VehicleID new_id = std::get<1>(result);
+
+	const bool ok = cost.Succeeded() && new_id != VehicleID::Invalid();
+	return dump({
+		{"ok", ok},
+		{"error", ok ? std::string{} : SctErrorFromCost(cost)},
+		{"id", ok ? static_cast<int>(new_id.base()) : -1},
+		{"cost", static_cast<int64_t>(cost.GetCost())},
+	});
+}
+
+/**
+ * Create a vehicle group. vt: 0=train,1=road,2=ship,3=aircraft. A top-level
+ * group uses GroupID::Invalid() as parent. group_cmd.h:28 CmdCreateGroup.
+ * @return {ok, error, id}; id is the new group, -1 on failure.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_create_group(int vehicle_type, int parent_group)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}, {"id", -1}});
+	}
+	if (vehicle_type < VEH_TRAIN || vehicle_type > VEH_AIRCRAFT) {
+		return dump({{"ok", false}, {"error", "invalid vehicle type"}, {"id", -1}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	const GroupID parent = (parent_group < 0)
+			? GroupID::Invalid()
+			: GroupID{static_cast<uint16_t>(parent_group)};
+	auto result = Command<CMD_CREATE_GROUP>::Do(
+			DoCommandFlag::Execute,
+			static_cast<VehicleType>(vehicle_type),
+			parent);
+	const CommandCost &cost = std::get<0>(result);
+	const GroupID gid = std::get<1>(result);
+
+	const bool ok = cost.Succeeded() && gid != GroupID::Invalid();
+	return dump({
+		{"ok", ok},
+		{"error", ok ? std::string{} : SctErrorFromCost(cost)},
+		{"id", ok ? static_cast<int>(gid.base()) : -1},
+	});
+}
+
+/**
+ * Move a vehicle into a group. add_shared != 0 also moves all vehicles that
+ * share the same orders. group_cmd.h:31 CmdAddVehicleGroup.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_add_to_group(int group_id, int vehicle_id, int add_shared)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const VehicleID vid{static_cast<uint32_t>(vehicle_id)};
+	if (!Vehicle::IsValidID(vid)) {
+		return dump({{"ok", false}, {"error", "invalid vehicle"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	auto result = Command<CMD_ADD_VEHICLE_GROUP>::Do(
+			DoCommandFlag::Execute,
+			GroupID{static_cast<uint16_t>(group_id)},
+			vid,
+			add_shared != 0,
+			VehicleListIdentifier{});
+	const CommandCost &cost = std::get<0>(result);
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Refit a vehicle to carry a different cargo. cargo_type is a CargoType id
+ * (0..NUM_CARGO-1). Refits the whole consist. vehicle_cmd.h:22 CmdRefitVehicle.
+ * @return {ok, error, cost}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_refit_vehicle(int vehicle_id, int cargo_type)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}, {"cost", 0}});
+	}
+
+	const VehicleID vid{static_cast<uint32_t>(vehicle_id)};
+	if (!Vehicle::IsValidID(vid)) {
+		return dump({{"ok", false}, {"error", "invalid vehicle"}, {"cost", 0}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	auto result = Command<CMD_REFIT_VEHICLE>::Do(
+			DoCommandFlag::Execute,
+			vid,
+			static_cast<CargoType>(cargo_type),
+			0,      /* new_subtype */
+			false,  /* auto_refit */
+			false,  /* only_this */
+			0);     /* num_vehicles: 0 = whole consist */
+	const CommandCost &cost = std::get<0>(result);
+	const bool ok = cost.Succeeded();
+	return dump({
+		{"ok", ok},
+		{"error", ok ? std::string{} : SctErrorFromCost(cost)},
+		{"cost", static_cast<int64_t>(cost.GetCost())},
+	});
+}
+
+/**
+ * Rename a vehicle. Empty name resets to the default. vehicle_cmd.h:25
+ * CmdRenameVehicle.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_rename_vehicle(int vehicle_id, const char *name)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const VehicleID vid{static_cast<uint32_t>(vehicle_id)};
+	if (!Vehicle::IsValidID(vid)) {
+		return dump({{"ok", false}, {"error", "invalid vehicle"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_RENAME_VEHICLE>::Do(
+			DoCommandFlag::Execute,
+			vid,
+			std::string{name == nullptr ? "" : name});
+	return dump(SctOkResult(cost));
 }
 
 /**

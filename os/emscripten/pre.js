@@ -16,6 +16,11 @@ Module.sct = (function() {
     var _setBuildParam = null;
     var _addOrder = null;
     var _vehicleOrders = null;
+    var _cloneVehicle = null;
+    var _createGroup = null;
+    var _addToGroup = null;
+    var _refitVehicle = null;
+    var _renameVehicle = null;
     return {
         exec: function(cmd) {
             if (!_exec) _exec = Module.cwrap('sct_console_exec', null, ['string']);
@@ -70,6 +75,26 @@ Module.sct = (function() {
             if (!_vehicleOrders) _vehicleOrders = Module.cwrap('sct_vehicle_orders', 'string', ['number']);
             var r = _vehicleOrders(id|0);
             return r ? JSON.parse(r) : null;
+        },
+        cloneVehicle: function(depotTile, vehicleId, shareOrders) {
+            if (!_cloneVehicle) _cloneVehicle = Module.cwrap('sct_clone_vehicle', 'string', ['number', 'number', 'number']);
+            return JSON.parse(_cloneVehicle(depotTile|0, vehicleId|0, shareOrders ? 1 : 0));
+        },
+        createGroup: function(vehicleType, parentGroup) {
+            if (!_createGroup) _createGroup = Module.cwrap('sct_create_group', 'string', ['number', 'number']);
+            return JSON.parse(_createGroup(vehicleType|0, parentGroup === undefined ? -1 : parentGroup|0));
+        },
+        addToGroup: function(groupId, vehicleId, addShared) {
+            if (!_addToGroup) _addToGroup = Module.cwrap('sct_add_to_group', 'string', ['number', 'number', 'number']);
+            return JSON.parse(_addToGroup(groupId|0, vehicleId|0, addShared ? 1 : 0));
+        },
+        refitVehicle: function(vehicleId, cargoType) {
+            if (!_refitVehicle) _refitVehicle = Module.cwrap('sct_refit_vehicle', 'string', ['number', 'number']);
+            return JSON.parse(_refitVehicle(vehicleId|0, cargoType|0));
+        },
+        renameVehicle: function(vehicleId, name) {
+            if (!_renameVehicle) _renameVehicle = Module.cwrap('sct_rename_vehicle', 'string', ['number', 'string']);
+            return JSON.parse(_renameVehicle(vehicleId|0, name == null ? '' : String(name)));
         },
     };
 })();
