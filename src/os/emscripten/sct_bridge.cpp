@@ -52,6 +52,9 @@
 #include "../../window_func.h"
 #include "../../window_gui.h"
 #include "../../tile_map.h"
+#include "../../rail_map.h"
+#include "../../road_map.h"
+#include "../../station_map.h"
 #include "../../landscape.h"
 #include "../../zoom_func.h"
 #include "../../3rdparty/nlohmann/json.hpp"
@@ -433,6 +436,36 @@ static DiagDirection SctResolveDiagDir(int p2)
 	return DIAGDIR_NE;
 }
 
+/**
+ * Auto-pick rail depot exit direction toward adjacent track (Wave 5, dir=255).
+ * Scans DiagDirections NE/SE/SW/NW; faces the first plain-rail or rail-station neighbour.
+ * Falls back to DIAGDIR_NE when none found. Skips invalid/map-edge neighbours.
+ */
+static DiagDirection SctAutoOrientRailDepot(TileIndex tile)
+{
+	for (DiagDirection d = DIAGDIR_BEGIN; d < DIAGDIR_END; d++) {
+		const TileIndex n = TileAddByDiagDir(tile, d);
+		if (!IsValidTile(n)) continue;
+		if (IsPlainRailTile(n) || IsRailStationTile(n)) return d;
+	}
+	return DIAGDIR_NE;
+}
+
+/**
+ * Auto-pick road depot exit direction toward adjacent road (Wave 5, dir=255).
+ * Scans DiagDirections NE/SE/SW/NW; faces the first normal road neighbour.
+ * Falls back to DIAGDIR_NE when none found. Skips invalid/map-edge neighbours.
+ */
+static DiagDirection SctAutoOrientRoadDepot(TileIndex tile)
+{
+	for (DiagDirection d = DIAGDIR_BEGIN; d < DIAGDIR_END; d++) {
+		const TileIndex n = TileAddByDiagDir(tile, d);
+		if (!IsValidTile(n)) continue;
+		if (IsNormalRoadTile(n)) return d;
+	}
+	return DIAGDIR_NE;
+}
+
 static Axis SctResolveAxis(int p1)
 {
 	return (p1 == 1) ? AXIS_Y : AXIS_X;
@@ -627,9 +660,11 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 	}
 
 	if (std::strcmp(action, "rail_depot") == 0) {
-		/* rail_cmd.h:23 CmdBuildTrainDepot */
+		/* rail_cmd.h:23 CmdBuildTrainDepot; p2==255 → auto-orient toward adjacent rail */
 		const RailType rt = SctResolveRailType(p1);
-		const DiagDirection dir = SctResolveDiagDir(p2);
+		const DiagDirection dir = (p2 == 255)
+				? SctAutoOrientRailDepot(tile_a)
+				: SctResolveDiagDir(p2);
 		CommandCost cost = Command<CMD_BUILD_TRAIN_DEPOT>::Do(
 				DoCommandFlag::Execute, tile_a, rt, dir);
 		return dump(SctCostResult(cost));
@@ -667,9 +702,11 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 	}
 
 	if (std::strcmp(action, "road_depot") == 0) {
-		/* road_cmd.h:27 CmdBuildRoadDepot */
+		/* road_cmd.h:27 CmdBuildRoadDepot; p2==255 → auto-orient toward adjacent road */
 		const RoadType rt = SctResolveRoadType(p1);
-		const DiagDirection dir = SctResolveDiagDir(p2);
+		const DiagDirection dir = (p2 == 255)
+				? SctAutoOrientRoadDepot(tile_a)
+				: SctResolveDiagDir(p2);
 		CommandCost cost = Command<CMD_BUILD_ROAD_DEPOT>::Do(
 				DoCommandFlag::Execute, tile_a, rt, dir);
 		return dump(SctCostResult(cost));
