@@ -8,6 +8,11 @@ Module.sct = (function() {
     var _setFastForward = null;
     var _returnToMenu = null;
     var _query = null;
+    var _tileAt = null;
+    var _build = null;
+    var _buildVehicle = null;
+    var _vehicleCmd = null;
+    var _setBuildParam = null;
     return {
         exec: function(cmd) {
             if (!_exec) _exec = Module.cwrap('sct_console_exec', null, ['string']);
@@ -28,6 +33,26 @@ Module.sct = (function() {
         query: function(kind) {
             if (!_query) _query = Module.cwrap('sct_query', 'string', ['string']);
             return JSON.parse(_query(kind));
+        },
+        tileAt: function(px, py) {
+            if (!_tileAt) _tileAt = Module.cwrap('sct_tile_at_screen', 'string', ['number', 'number']);
+            return JSON.parse(_tileAt(px, py));
+        },
+        build: function(action, a, b, p1, p2) {
+            if (!_build) _build = Module.cwrap('sct_build', 'string', ['string', 'number', 'number', 'number', 'number']);
+            return JSON.parse(_build(action, a|0, b|0, p1|0, p2|0));
+        },
+        buildVehicle: function(depotTile, engineId) {
+            if (!_buildVehicle) _buildVehicle = Module.cwrap('sct_build_vehicle', 'string', ['number', 'number']);
+            return JSON.parse(_buildVehicle(depotTile|0, engineId|0));
+        },
+        vehicleCmd: function(vehicleId, action) {
+            if (!_vehicleCmd) _vehicleCmd = Module.cwrap('sct_vehicle_cmd', 'string', ['number', 'string']);
+            return JSON.parse(_vehicleCmd(vehicleId|0, action));
+        },
+        setBuildParam: function(key, value) {
+            if (!_setBuildParam) _setBuildParam = Module.cwrap('sct_set_build_param', null, ['string', 'number']);
+            return _setBuildParam(key, value|0);
         },
     };
 })();

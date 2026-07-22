@@ -16,6 +16,7 @@
 #include "../../company_base.h"
 #include "../../company_func.h"
 #include "../../map_func.h"
+#include "../../map_type.h"
 #include "../../timer/timer_game_calendar.h"
 #include "../../town.h"
 #include "../../industry.h"
@@ -30,13 +31,35 @@
 #include "../../strings_func.h"
 #include "../../economy_type.h"
 #include "../../core/math_func.hpp"
+#include "../../core/backup_type.hpp"
+#include "../../command_func.h"
+#include "../../rail_cmd.h"
+#include "../../road_cmd.h"
+#include "../../station_cmd.h"
+#include "../../vehicle_cmd.h"
+#include "../../landscape_cmd.h"
+#include "../../terraform_cmd.h"
+#include "../../newgrf_station.h"
+#include "../../rail.h"
+#include "../../road_func.h"
+#include "../../track_type.h"
+#include "../../direction_type.h"
+#include "../../slope_type.h"
+#include "../../cargo_type.h"
+#include "../../network/network_type.h"
+#include "../../viewport_func.h"
+#include "../../window_func.h"
+#include "../../window_gui.h"
+#include "../../tile_map.h"
 #include "../../3rdparty/nlohmann/json.hpp"
 
 #include "table/strings.h"
 
 #include <emscripten.h>
+#include <algorithm>
 #include <cstring>
 #include <string>
+#include <tuple>
 
 extern "C" {
 
@@ -328,6 +351,96 @@ static nlohmann::json SctQueryNews()
 	return arr;
 }
 
+/* ---- Write-bridge helpers (build / place / vehicle commands) ---- */
+
+/** Default railtype for build commands when p1 == 0 (0 = auto-pick first available). */
+static int g_sct_railtype = 0;
+/** Default roadtype for build commands when p1 == 0 (0 = auto-pick first available). */
+static int g_sct_roadtype = 0;
+
+static bool SctCanBuild()
+{
+	return SctInGame() && Map::IsInitialized() && Company::IsValidID(_local_company);
+}
+
+static std::string SctErrorFromCost(const CommandCost &cost)
+{
+	if (cost.Succeeded()) return {};
+	const StringID msg = cost.GetErrorMessage();
+	if (msg != INVALID_STRING_ID) return GetString(msg);
+	return "build failed";
+}
+
+static nlohmann::json SctCostResult(const CommandCost &cost)
+{
+	return {
+		{"ok", cost.Succeeded()},
+		{"error", SctErrorFromCost(cost)},
+		{"cost", static_cast<int64_t>(cost.GetCost())},
+	};
+}
+
+static nlohmann::json SctOkResult(const CommandCost &cost)
+{
+	return {
+		{"ok", cost.Succeeded()},
+		{"error", SctErrorFromCost(cost)},
+	};
+}
+
+static RailType SctResolveRailType(int p1)
+{
+	int rt = (p1 != 0) ? p1 : g_sct_railtype;
+	if (rt > 0 && rt < RAILTYPE_END) return static_cast<RailType>(rt);
+
+	const Company *c = Company::GetIfValid(_local_company);
+	if (c != nullptr) {
+		for (RailType candidate = RAILTYPE_BEGIN; candidate < RAILTYPE_END; candidate++) {
+			if (c->avail_railtypes.Test(candidate)) return candidate;
+		}
+	}
+	return RAILTYPE_RAIL;
+}
+
+static RoadType SctResolveRoadType(int p1)
+{
+	int rt = (p1 != 0) ? p1 : g_sct_roadtype;
+	if (rt > 0 && rt < ROADTYPE_END) return static_cast<RoadType>(rt);
+
+	const Company *c = Company::GetIfValid(_local_company);
+	if (c != nullptr) {
+		for (RoadType candidate = ROADTYPE_BEGIN; candidate < ROADTYPE_END; candidate++) {
+			if (c->avail_roadtypes.Test(candidate)) return candidate;
+		}
+	}
+	return ROADTYPE_ROAD;
+}
+
+static Track SctResolveTrack(int p2, TileIndex start, TileIndex end)
+{
+	if (p2 >= TRACK_BEGIN && p2 < TRACK_END) return static_cast<Track>(p2);
+	if (TileY(start) == TileY(end)) return TRACK_X;
+	if (TileX(start) == TileX(end)) return TRACK_Y;
+	return TRACK_X;
+}
+
+static DiagDirection SctResolveDiagDir(int p2)
+{
+	if (p2 >= DIAGDIR_BEGIN && p2 < DIAGDIR_END) return static_cast<DiagDirection>(p2);
+	return DIAGDIR_NE;
+}
+
+static Axis SctResolveAxis(int p1)
+{
+	return (p1 == 1) ? AXIS_Y : AXIS_X;
+}
+
+static uint8_t SctClampStationDim(int value, uint8_t fallback)
+{
+	if (value < 1 || value > 7) return fallback;
+	return static_cast<uint8_t>(value);
+}
+
 } // namespace
 
 /**
@@ -365,6 +478,305 @@ const char *EMSCRIPTEN_KEEPALIVE sct_query(const char *kind)
 
 	buffer = j.dump();
 	return buffer.c_str();
+}
+
+/**
+ * Resolve a canvas pixel to a world tile via the main viewport.
+ * @return JSON `{"tile":idx,"x":TileX,"y":TileY}` or the literal JSON `null`.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_tile_at_screen(int px, int py)
+{
+	static std::string buffer;
+
+	if (!SctInGame() || !Map::IsInitialized()) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	Window *w = GetMainWindow();
+	if (w == nullptr || w->viewport == nullptr) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	Point pt = TranslateXYToTileCoord(*w->viewport, px, py, true);
+	if (pt.x == -1 && pt.y == -1) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	TileIndex tile = TileVirtXY(pt.x, pt.y);
+	if (!IsValidTile(tile)) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	nlohmann::json j = {
+		{"tile", tile.base()},
+		{"x", TileX(tile)},
+		{"y", TileY(tile)},
+	};
+	buffer = j.dump();
+	return buffer.c_str();
+}
+
+/**
+ * Dispatch a map build / landscape action for the local company.
+ * @param action Action name from the sct command contract.
+ * @param a Primary tile (TileIndex base) / start of range.
+ * @param b Secondary tile / end of range.
+ * @param p1 Action-specific param (railtype, axis, roadtype, airport type, …).
+ * @param p2 Action-specific param (track, direction, station packing, layout, …).
+ * @return JSON `{"ok":bool,"error":"...","cost":n}`.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int p1, int p2)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (action == nullptr) {
+		return dump({{"ok", false}, {"error", "unknown action"}, {"cost", 0}});
+	}
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}, {"cost", 0}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	const TileIndex tile_a{static_cast<uint32_t>(a)};
+	const TileIndex tile_b{static_cast<uint32_t>(b)};
+
+	if (std::strcmp(action, "rail_track") == 0) {
+		/* rail_cmd.h:19 CmdBuildRailroadTrack(end, start, railtype, track, auto_remove_signals, fail_on_obstacle) */
+		const RailType rt = SctResolveRailType(p1);
+		const Track track = SctResolveTrack(p2, tile_a, tile_b);
+		CommandCost cost = Command<CMD_BUILD_RAILROAD_TRACK>::Do(
+				DoCommandFlag::Execute, tile_b, tile_a, rt, track, true, false);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "rail_station") == 0) {
+		/* station_cmd.h:28 CmdBuildRailStation */
+		const RailType rt = SctResolveRailType(0); /* use stash / first available; p1 is axis */
+		const Axis axis = SctResolveAxis(p1);
+		const uint8_t numtracks = SctClampStationDim((p2 >> 8) & 0xFF, 1);
+		const uint8_t plat_len = SctClampStationDim(p2 & 0xFF, 3);
+		CommandCost cost = Command<CMD_BUILD_RAIL_STATION>::Do(
+				DoCommandFlag::Execute, tile_a, rt, axis, numtracks, plat_len,
+				STAT_CLASS_DFLT, 0, StationID::Invalid(), false);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "rail_depot") == 0) {
+		/* rail_cmd.h:23 CmdBuildTrainDepot */
+		const RailType rt = SctResolveRailType(p1);
+		const DiagDirection dir = SctResolveDiagDir(p2);
+		CommandCost cost = Command<CMD_BUILD_TRAIN_DEPOT>::Do(
+				DoCommandFlag::Execute, tile_a, rt, dir);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "signal") == 0) {
+		/* No CMD_BUILD_SIGNALS in 15.3; CMD_BUILD_SINGLE_SIGNAL / CMD_BUILD_SIGNAL_TRACK
+		 * (rail_cmd.h:24,27) need many SignalType/variant args. Stub for now. */
+		return dump({{"ok", false}, {"error", "signals pending"}, {"cost", 0}});
+	}
+
+	if (std::strcmp(action, "road") == 0) {
+		const RoadType rt = SctResolveRoadType(p1);
+		if (a == b || !IsValidTile(tile_b) || tile_a == tile_b) {
+			/* Single tile: road_cmd.h:26 CmdBuildRoad */
+			CommandCost cost = Command<CMD_BUILD_ROAD>::Do(
+					DoCommandFlag::Execute, tile_a, ROAD_X, rt, DRD_NONE, TownID::Invalid());
+			return dump(SctCostResult(cost));
+		}
+		if (TileX(tile_a) != TileX(tile_b) && TileY(tile_a) != TileY(tile_b)) {
+			return dump({{"ok", false}, {"error", "road not axis-aligned"}, {"cost", 0}});
+		}
+		/* Drag: road_cmd.h:24 CmdBuildLongRoad(end, start, rt, axis, drd, start_half, end_half, is_ai) */
+		const Axis axis = (TileY(tile_a) != TileY(tile_b)) ? AXIS_Y : AXIS_X;
+		CommandCost cost = Command<CMD_BUILD_LONG_ROAD>::Do(
+				DoCommandFlag::Execute, tile_b, tile_a, rt, axis, DRD_NONE, false, false, false);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "road_depot") == 0) {
+		/* road_cmd.h:27 CmdBuildRoadDepot */
+		const RoadType rt = SctResolveRoadType(p1);
+		const DiagDirection dir = SctResolveDiagDir(p2);
+		CommandCost cost = Command<CMD_BUILD_ROAD_DEPOT>::Do(
+				DoCommandFlag::Execute, tile_a, rt, dir);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "dock") == 0) {
+		/* station_cmd.h:27 CmdBuildDock */
+		CommandCost cost = Command<CMD_BUILD_DOCK>::Do(
+				DoCommandFlag::Execute, tile_a, StationID::Invalid(), false);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "airport") == 0) {
+		/* station_cmd.h:26 CmdBuildAirport */
+		CommandCost cost = Command<CMD_BUILD_AIRPORT>::Do(
+				DoCommandFlag::Execute, tile_a,
+				static_cast<uint8_t>(std::clamp(p1, 0, 255)),
+				static_cast<uint8_t>(std::clamp(p2, 0, 255)),
+				StationID::Invalid(), false);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "demolish") == 0) {
+		if (a != b && IsValidTile(tile_b) && tile_a != tile_b) {
+			/* landscape_cmd.h CmdClearArea — returns (CommandCost, Money) */
+			auto res = Command<CMD_CLEAR_AREA>::Do(DoCommandFlag::Execute, tile_b, tile_a, false);
+			const CommandCost &cost = std::get<0>(res);
+			nlohmann::json j = SctCostResult(cost);
+			if (cost.Succeeded()) j["cost"] = static_cast<int64_t>(std::get<1>(res));
+			return dump(j);
+		}
+		/* landscape_cmd.h CmdLandscapeClear */
+		CommandCost cost = Command<CMD_LANDSCAPE_CLEAR>::Do(DoCommandFlag::Execute, tile_a);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "terrain_up") == 0) {
+		/* terraform_cmd.h CmdTerraformLand(tile, slope, dir_up) — GUI uses SLOPE_N */
+		auto res = Command<CMD_TERRAFORM_LAND>::Do(DoCommandFlag::Execute, tile_a, SLOPE_N, true);
+		const CommandCost &cost = std::get<0>(res);
+		nlohmann::json j = SctCostResult(cost);
+		if (cost.Succeeded()) j["cost"] = static_cast<int64_t>(std::get<1>(res));
+		return dump(j);
+	}
+
+	if (std::strcmp(action, "terrain_down") == 0) {
+		auto res = Command<CMD_TERRAFORM_LAND>::Do(DoCommandFlag::Execute, tile_a, SLOPE_N, false);
+		const CommandCost &cost = std::get<0>(res);
+		nlohmann::json j = SctCostResult(cost);
+		if (cost.Succeeded()) j["cost"] = static_cast<int64_t>(std::get<1>(res));
+		return dump(j);
+	}
+
+	if (std::strcmp(action, "terrain_level") == 0) {
+		/* terraform_cmd.h CmdLevelLand(end, start, diagonal, LM_LEVEL) */
+		auto res = Command<CMD_LEVEL_LAND>::Do(DoCommandFlag::Execute, tile_b, tile_a, false, LM_LEVEL);
+		const CommandCost &cost = std::get<0>(res);
+		nlohmann::json j = SctCostResult(cost);
+		if (cost.Succeeded()) j["cost"] = static_cast<int64_t>(std::get<1>(res));
+		return dump(j);
+	}
+
+	return dump({{"ok", false}, {"error", "unknown action"}, {"cost", 0}});
+}
+
+/**
+ * Build a vehicle in a depot; returns the new vehicle id on success.
+ * vehicle_cmd.h:20 CmdBuildVehicle.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_build_vehicle(int depot_tile, int engine_id)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}, {"id", -1}, {"cost", 0}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	auto result = Command<CMD_BUILD_VEHICLE>::Do(
+			DoCommandFlag::Execute,
+			TileIndex{static_cast<uint32_t>(depot_tile)},
+			EngineID{static_cast<uint16_t>(engine_id)},
+			true,
+			INVALID_CARGO,
+			INVALID_CLIENT_ID);
+	const CommandCost &cost = std::get<0>(result);
+	const VehicleID veh_id = std::get<1>(result);
+
+	const bool ok = cost.Succeeded() && veh_id != VehicleID::Invalid();
+	return dump({
+		{"ok", ok},
+		{"error", ok ? std::string{} : SctErrorFromCost(cost)},
+		{"id", ok ? static_cast<int>(veh_id.base()) : -1},
+		{"cost", static_cast<int64_t>(cost.GetCost())},
+	});
+}
+
+/**
+ * Vehicle management: start/stop (toggle), sell, sendToDepot.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_vehicle_cmd(int vehicle_id, const char *action)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (action == nullptr) {
+		return dump({{"ok", false}, {"error", "unknown action"}});
+	}
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const VehicleID vid{static_cast<uint32_t>(vehicle_id)};
+	if (!Vehicle::IsValidID(vid)) {
+		return dump({{"ok", false}, {"error", "invalid vehicle"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	if (std::strcmp(action, "start") == 0 || std::strcmp(action, "stop") == 0) {
+		/* vehicle_cmd.h:27 CmdStartStopVehicle — toggles start/stop */
+		CommandCost cost = Command<CMD_START_STOP_VEHICLE>::Do(
+				DoCommandFlag::Execute, vid, false);
+		return dump(SctOkResult(cost));
+	}
+
+	if (std::strcmp(action, "sell") == 0) {
+		/* vehicle_cmd.h:21 CmdSellVehicle */
+		CommandCost cost = Command<CMD_SELL_VEHICLE>::Do(
+				DoCommandFlag::Execute, vid, true, false, INVALID_CLIENT_ID);
+		return dump(SctOkResult(cost));
+	}
+
+	if (std::strcmp(action, "sendToDepot") == 0) {
+		/* vehicle_cmd.h:23 CmdSendVehicleToDepot */
+		CommandCost cost = Command<CMD_SEND_VEHICLE_TO_DEPOT>::Do(
+				DoCommandFlag::Execute, vid, DepotCommandFlags{}, VehicleListIdentifier{});
+		return dump(SctOkResult(cost));
+	}
+
+	if (std::strcmp(action, "skipOrder") == 0) {
+		return dump({{"ok", false}, {"error", "skipOrder pending"}});
+	}
+
+	return dump({{"ok", false}, {"error", "unknown action"}});
+}
+
+/**
+ * Stash build defaults read by sct_build when p1 == 0.
+ * Keys: "railtype", "roadtype".
+ */
+void EMSCRIPTEN_KEEPALIVE sct_set_build_param(const char *key, int value)
+{
+	if (key == nullptr) return;
+	if (std::strcmp(key, "railtype") == 0) {
+		g_sct_railtype = value;
+	} else if (std::strcmp(key, "roadtype") == 0) {
+		g_sct_roadtype = value;
+	}
 }
 
 } /* extern "C" */
