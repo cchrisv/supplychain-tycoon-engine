@@ -422,14 +422,6 @@ static RoadType SctResolveRoadType(int p1)
 	return ROADTYPE_ROAD;
 }
 
-static Track SctResolveTrack(int p2, TileIndex start, TileIndex end)
-{
-	if (p2 >= TRACK_BEGIN && p2 < TRACK_END) return static_cast<Track>(p2);
-	if (TileY(start) == TileY(end)) return TRACK_X;
-	if (TileX(start) == TileX(end)) return TRACK_Y;
-	return TRACK_X;
-}
-
 static DiagDirection SctResolveDiagDir(int p2)
 {
 	if (p2 >= DIAGDIR_BEGIN && p2 < DIAGDIR_END) return static_cast<DiagDirection>(p2);
@@ -661,11 +653,57 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 	const TileIndex tile_b{static_cast<uint32_t>(b)};
 
 	if (std::strcmp(action, "rail_track") == 0) {
-		/* rail_cmd.h:19 CmdBuildRailroadTrack(end, start, railtype, track, auto_remove_signals, fail_on_obstacle) */
+		/* Wave 7 — robust track drag: snap to dominant axis, auto-flatten the
+		 * line, then build. rail_cmd.h:19 CmdBuildRailroadTrack(end, start,
+		 * railtype, track, auto_remove_signals, fail_on_obstacle).
+		 * p2==0 (or out of range) = auto snap; non-zero valid Track overrides
+		 * and keeps end = b (contract: track dir 0 auto). */
 		const RailType rt = SctResolveRailType(p1);
-		const Track track = SctResolveTrack(p2, tile_a, tile_b);
+
+		TileIndex snapped_end = tile_b;
+		Track track = TRACK_X;
+
+		if (p2 != 0 && p2 >= TRACK_BEGIN && p2 < TRACK_END) {
+			/* Explicit track override — keep dragged end tile as-is. */
+			track = static_cast<Track>(p2);
+			snapped_end = tile_b;
+		} else {
+			/* Snap to dominant axis (map_func.h TileX/TileY/TileXY). */
+			const int ax = static_cast<int>(TileX(tile_a));
+			const int ay = static_cast<int>(TileY(tile_a));
+			const int bx = static_cast<int>(TileX(tile_b));
+			const int by = static_cast<int>(TileY(tile_b));
+			const int dx = std::abs(bx - ax);
+			const int dy = std::abs(by - ay);
+			const int max_x = static_cast<int>(Map::MaxX());
+			const int max_y = static_cast<int>(Map::MaxY());
+
+			if (dx >= dy) {
+				/* Horizontal line → TRACK_X (track_type.h:21); snap Y to start. */
+				track = TRACK_X;
+				const int end_x = std::clamp(bx, 0, max_x);
+				const int end_y = std::clamp(ay, 0, max_y);
+				snapped_end = TileXY(static_cast<uint>(end_x), static_cast<uint>(end_y));
+			} else {
+				/* Vertical line → TRACK_Y (track_type.h:22); snap X to start. */
+				track = TRACK_Y;
+				const int end_x = std::clamp(ax, 0, max_x);
+				const int end_y = std::clamp(by, 0, max_y);
+				snapped_end = TileXY(static_cast<uint>(end_x), static_cast<uint>(end_y));
+			}
+		}
+
+		/* Off-map guard: start/end must be on the map (tile_map.h IsValidTile). */
+		if (!IsValidTile(tile_a) || !IsValidTile(snapped_end)) {
+			return dump({{"ok", false}, {"error", "invalid tile"}, {"cost", 0}});
+		}
+
+		/* Auto-flatten the line first (terraform_cmd.h:18 CmdLevelLand).
+		 * Inside AutoRestoreBackup company block; ignore result (already flat / no funds). */
+		(void)Command<CMD_LEVEL_LAND>::Do(DoCommandFlag::Execute, snapped_end, tile_a, false, LM_LEVEL);
+
 		CommandCost cost = Command<CMD_BUILD_RAILROAD_TRACK>::Do(
-				DoCommandFlag::Execute, tile_b, tile_a, rt, track, true, false);
+				DoCommandFlag::Execute, snapped_end, tile_a, rt, track, true, false);
 		return dump(SctCostResult(cost));
 	}
 
