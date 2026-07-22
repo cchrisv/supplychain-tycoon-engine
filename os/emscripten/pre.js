@@ -21,6 +21,12 @@ Module.sct = (function() {
     var _addToGroup = null;
     var _refitVehicle = null;
     var _renameVehicle = null;
+    var _companyLoan = null;
+    var _deleteOrder = null;
+    var _modifyOrder = null;
+    var _scrollToTile = null;
+    var _tileInfo = null;
+    var _renameStation = null;
     return {
         exec: function(cmd) {
             if (!_exec) _exec = Module.cwrap('sct_console_exec', null, ['string']);
@@ -95,6 +101,30 @@ Module.sct = (function() {
         renameVehicle: function(vehicleId, name) {
             if (!_renameVehicle) _renameVehicle = Module.cwrap('sct_rename_vehicle', 'string', ['number', 'string']);
             return JSON.parse(_renameVehicle(vehicleId|0, name == null ? '' : String(name)));
+        },
+        companyLoan: function(delta) {
+            if (!_companyLoan) _companyLoan = Module.cwrap('sct_company_loan', 'string', ['number']);
+            return JSON.parse(_companyLoan(delta|0));
+        },
+        deleteOrder: function(vehicleId, orderIndex) {
+            if (!_deleteOrder) _deleteOrder = Module.cwrap('sct_delete_order', 'string', ['number', 'number']);
+            return JSON.parse(_deleteOrder(vehicleId|0, orderIndex|0));
+        },
+        modifyOrder: function(vehicleId, orderIndex, mof, value) {
+            if (!_modifyOrder) _modifyOrder = Module.cwrap('sct_modify_order', 'string', ['number', 'number', 'number', 'number']);
+            return JSON.parse(_modifyOrder(vehicleId|0, orderIndex|0, mof|0, value|0));
+        },
+        scrollToTile: function(tile) {
+            if (!_scrollToTile) _scrollToTile = Module.cwrap('sct_scroll_to_tile', 'string', ['number']);
+            return JSON.parse(_scrollToTile(tile|0));
+        },
+        tileInfo: function(tile) {
+            if (!_tileInfo) _tileInfo = Module.cwrap('sct_tile_info', 'string', ['number']);
+            return JSON.parse(_tileInfo(tile|0));
+        },
+        renameStation: function(stationId, name) {
+            if (!_renameStation) _renameStation = Module.cwrap('sct_rename_station', 'string', ['number', 'string']);
+            return JSON.parse(_renameStation(stationId|0, name == null ? '' : String(name)));
         },
     };
 })();

@@ -39,6 +39,8 @@
 #include "../../station_cmd.h"
 #include "../../vehicle_cmd.h"
 #include "../../order_cmd.h"
+#include "../../order_type.h"
+#include "../../misc_cmd.h"
 #include "../../landscape_cmd.h"
 #include "../../terraform_cmd.h"
 #include "../../newgrf_station.h"
@@ -57,6 +59,10 @@
 #include "../../rail_map.h"
 #include "../../road_map.h"
 #include "../../station_map.h"
+#include "../../water_map.h"
+#include "../../depot_map.h"
+#include "../../industry_map.h"
+#include "../../town_map.h"
 #include "../../landscape.h"
 #include "../../zoom_func.h"
 #include "../../3rdparty/nlohmann/json.hpp"
@@ -265,6 +271,8 @@ static nlohmann::json SctQueryVehicles()
 			{"profitLastYear", static_cast<int64_t>(v->GetDisplayProfitLastYear())},
 			{"age", v->age.base()},
 			{"groupId", v->group_id.base()},
+			/* vehstatus VehState::Stopped == parked/not running (vehicle_base.h:309). */
+			{"stopped", v->vehstatus.Test(VehState::Stopped)},
 		});
 	}
 	return arr;
@@ -923,7 +931,17 @@ const char *EMSCRIPTEN_KEEPALIVE sct_vehicle_cmd(int vehicle_id, const char *act
 	AutoRestoreBackup backup(_current_company, _local_company);
 
 	if (std::strcmp(action, "start") == 0 || std::strcmp(action, "stop") == 0) {
-		/* vehicle_cmd.h:27 CmdStartStopVehicle — toggles start/stop */
+		/* vehicle_cmd.h:27 CmdStartStopVehicle — toggles start/stop. The command
+		 * is a pure toggle, so make this idempotent: only issue it when the
+		 * current state differs from the request (the HUD has mass "Stop all"
+		 * buttons — a blind toggle would start already-stopped vehicles).
+		 * vehicle_base.h:309 vehstatus; VehState::Stopped set == parked. */
+		const Vehicle *v = Vehicle::Get(vid);
+		const bool is_stopped = v->vehstatus.Test(VehState::Stopped);
+		const bool want_stopped = (std::strcmp(action, "stop") == 0);
+		if (is_stopped == want_stopped) {
+			return dump({{"ok", true}, {"error", std::string{}}});
+		}
 		CommandCost cost = Command<CMD_START_STOP_VEHICLE>::Do(
 				DoCommandFlag::Execute, vid, false);
 		return dump(SctOkResult(cost));
@@ -944,7 +962,17 @@ const char *EMSCRIPTEN_KEEPALIVE sct_vehicle_cmd(int vehicle_id, const char *act
 	}
 
 	if (std::strcmp(action, "skipOrder") == 0) {
-		return dump({{"ok", false}, {"error", "skipOrder pending"}});
+		/* order_cmd.h:18 CmdSkipToOrder — skip to the next order. Target index
+		 * mirrors the GUI skip button (order_gui.cpp:697):
+		 * (cur_implicit_order_index + 1) % GetNumOrders(). No-op for 0/1 orders. */
+		const Vehicle *v = Vehicle::Get(vid);
+		if (v->GetNumOrders() <= 1) {
+			return dump({{"ok", true}, {"error", std::string{}}});
+		}
+		const VehicleOrderID sel = static_cast<VehicleOrderID>(
+				(v->cur_implicit_order_index + 1) % v->GetNumOrders());
+		CommandCost cost = Command<CMD_SKIP_TO_ORDER>::Do(DoCommandFlag::Execute, vid, sel);
+		return dump(SctOkResult(cost));
 	}
 
 	return dump({{"ok", false}, {"error", "unknown action"}});
@@ -1237,6 +1265,266 @@ const char *EMSCRIPTEN_KEEPALIVE sct_rename_vehicle(int vehicle_id, const char *
 	CommandCost cost = Command<CMD_RENAME_VEHICLE>::Do(
 			DoCommandFlag::Execute,
 			vid,
+			std::string{name == nullptr ? "" : name});
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 10 — borrow (delta>0) or repay (delta<0) loan by |delta|.
+ * delta>0 → misc_cmd.h:24 CmdIncreaseLoan; delta<0 → CmdDecreaseLoan.
+ * Both use the fixed-Amount variant (LoanCommand::Amount, amount=|delta|).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_company_loan(int delta)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+	if (delta == 0) {
+		return dump({{"ok", true}, {"error", std::string{}}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	const Money amount = static_cast<Money>(std::abs(static_cast<int64_t>(delta)));
+	CommandCost cost = (delta > 0)
+			? Command<CMD_INCREASE_LOAN>::Do(DoCommandFlag::Execute, LoanCommand::Amount, amount)
+			: Command<CMD_DECREASE_LOAN>::Do(DoCommandFlag::Execute, LoanCommand::Amount, amount);
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 10 — delete the order at orderIndex from a vehicle's order list.
+ * order_cmd.h:19 CmdDeleteOrder.
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_delete_order(int vehicle_id, int order_index)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const VehicleID vid{static_cast<uint32_t>(vehicle_id)};
+	if (!Vehicle::IsValidID(vid)) {
+		return dump({{"ok", false}, {"error", "invalid vehicle"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_DELETE_ORDER>::Do(
+			DoCommandFlag::Execute, vid, static_cast<VehicleOrderID>(order_index));
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 10 — modify a field of an existing order. mof is a ModifyOrderFlags int
+ * (order_type.h:159): 0=MOF_NON_STOP, 1=MOF_STOP_LOCATION, 2=MOF_UNLOAD,
+ * 3=MOF_LOAD, 4=MOF_DEPOT_ACTION. value is the new field value.
+ * order_cmd.h:17 CmdModifyOrder.
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_modify_order(int vehicle_id, int order_index, int mof, int value)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const VehicleID vid{static_cast<uint32_t>(vehicle_id)};
+	if (!Vehicle::IsValidID(vid)) {
+		return dump({{"ok", false}, {"error", "invalid vehicle"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_MODIFY_ORDER>::Do(
+			DoCommandFlag::Execute, vid, static_cast<VehicleOrderID>(order_index),
+			static_cast<ModifyOrderFlags>(mof), static_cast<uint16_t>(value));
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 10 — scroll/centre the main viewport on a tile (not a Command).
+ * viewport_func.h:79 ScrollMainWindowToTile(tile, instant=true).
+ * @return {ok}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_scroll_to_tile(int tile)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctInGame() || !Map::IsInitialized()) {
+		return dump({{"ok", false}});
+	}
+	if (tile < 0 || static_cast<uint>(tile) >= Map::Size()) {
+		return dump({{"ok", false}});
+	}
+
+	bool ok = ScrollMainWindowToTile(TileIndex{static_cast<uint32_t>(tile)}, true);
+	return dump({{"ok", ok}});
+}
+
+/**
+ * Wave 10 — describe what is on a tile so the UI can route map clicks.
+ * Tile-map accessors (depot_map.h, station_map.h, industry_map.h, town_map.h)
+ * guarded by IsTileType checks; bounds-checked against Map::Size().
+ * @return JSON `{kind, id?, vehicleType?, owner?}` or `{kind:"invalid"}`.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_tile_info(int tile)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctInGame() || !Map::IsInitialized()) {
+		return dump({{"kind", "invalid"}});
+	}
+	if (tile < 0 || static_cast<uint>(tile) >= Map::Size()) {
+		return dump({{"kind", "invalid"}});
+	}
+
+	const TileIndex t{static_cast<uint32_t>(tile)};
+	nlohmann::json j = nlohmann::json::object();
+
+	switch (GetTileType(t)) {
+		case MP_CLEAR:
+			j["kind"] = "clear";
+			j["owner"] = GetTileOwner(t).base();
+			break;
+
+		case MP_TREES:
+			j["kind"] = "trees";
+			j["owner"] = GetTileOwner(t).base();
+			break;
+
+		case MP_RAILWAY:
+			if (IsRailDepotTile(t)) {
+				j["kind"] = "depot";
+				j["vehicleType"] = static_cast<int>(GetDepotVehicleType(t)); /* VEH_TRAIN = 0 */
+				j["id"] = static_cast<int>(GetDepotIndex(t).base());
+			} else {
+				j["kind"] = "rail";
+			}
+			j["owner"] = GetTileOwner(t).base();
+			break;
+
+		case MP_ROAD:
+			if (IsRoadDepotTile(t)) {
+				j["kind"] = "depot";
+				j["vehicleType"] = static_cast<int>(GetDepotVehicleType(t)); /* VEH_ROAD = 1 */
+				j["id"] = static_cast<int>(GetDepotIndex(t).base());
+			} else {
+				j["kind"] = "road";
+			}
+			j["owner"] = GetTileOwner(t).base();
+			break;
+
+		case MP_HOUSE:
+			j["kind"] = "house";
+			j["id"] = static_cast<int>(GetTownIndex(t).base()); /* no owner: MP_HOUSE */
+			break;
+
+		case MP_STATION:
+			if (IsHangarTile(t)) {
+				j["kind"] = "depot";
+				j["vehicleType"] = static_cast<int>(GetDepotVehicleType(t)); /* VEH_AIRCRAFT = 3 */
+			} else {
+				j["kind"] = "station";
+			}
+			j["id"] = static_cast<int>(GetStationIndex(t).base());
+			j["owner"] = GetTileOwner(t).base();
+			break;
+
+		case MP_WATER:
+			if (IsShipDepotTile(t)) {
+				j["kind"] = "depot";
+				j["vehicleType"] = static_cast<int>(GetDepotVehicleType(t)); /* VEH_SHIP = 2 */
+				j["id"] = static_cast<int>(GetDepotIndex(t).base());
+			} else {
+				j["kind"] = "water";
+			}
+			j["owner"] = GetTileOwner(t).base();
+			break;
+
+		case MP_INDUSTRY:
+			j["kind"] = "industry";
+			j["id"] = static_cast<int>(GetIndustryIndex(t).base()); /* no owner: MP_INDUSTRY */
+			break;
+
+		case MP_TUNNELBRIDGE:
+			j["kind"] = "tunnelbridge";
+			j["owner"] = GetTileOwner(t).base();
+			break;
+
+		case MP_OBJECT:
+			j["kind"] = "object";
+			j["owner"] = GetTileOwner(t).base();
+			break;
+
+		case MP_VOID:
+		default:
+			j["kind"] = "void";
+			break;
+	}
+
+	return dump(j);
+}
+
+/**
+ * Wave 10 — rename a station. Empty name resets to the default.
+ * station_cmd.h:32 CmdRenameStation.
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_rename_station(int station_id, const char *name)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const StationID sid{static_cast<uint16_t>(station_id)};
+	if (!Station::IsValidID(sid)) {
+		return dump({{"ok", false}, {"error", "invalid station"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_RENAME_STATION>::Do(
+			DoCommandFlag::Execute,
+			sid,
 			std::string{name == nullptr ? "" : name});
 	return dump(SctOkResult(cost));
 }
