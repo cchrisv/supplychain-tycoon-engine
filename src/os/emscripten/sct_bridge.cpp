@@ -477,6 +477,28 @@ static uint8_t SctClampStationDim(int value, uint8_t fallback)
 	return static_cast<uint8_t>(value);
 }
 
+/**
+ * Wave 6 — auto-flatten a width×height footprint at origin before build.
+ * Levels the axis-aligned rectangle origin..end via CMD_LEVEL_LAND (same
+ * pattern as terrain_level). Result is ignored (already flat / no funds).
+ * End tile is clamped onto the map so the level never walks off-map.
+ */
+static void SctLevelFootprint(TileIndex origin, int width, int height)
+{
+	if (!IsValidTile(origin) || width < 1 || height < 1) return;
+
+	const int ox = static_cast<int>(TileX(origin));
+	const int oy = static_cast<int>(TileY(origin));
+	const int max_x = static_cast<int>(Map::MaxX());
+	const int max_y = static_cast<int>(Map::MaxY());
+	const int end_x = std::min(ox + width - 1, max_x);
+	const int end_y = std::min(oy + height - 1, max_y);
+	const TileIndex end_tile = TileXY(static_cast<uint>(end_x), static_cast<uint>(end_y));
+
+	/* terraform_cmd.h:18 CmdLevelLand(end, start, diagonal, LM_LEVEL) — ignore result. */
+	(void)Command<CMD_LEVEL_LAND>::Do(DoCommandFlag::Execute, end_tile, origin, false, LM_LEVEL);
+}
+
 } // namespace
 
 /**
@@ -653,6 +675,11 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 		const Axis axis = SctResolveAxis(p1);
 		const uint8_t numtracks = SctClampStationDim((p2 >> 8) & 0xFF, 1);
 		const uint8_t plat_len = SctClampStationDim(p2 & 0xFF, 3);
+		/* Wave 6: flatten footprint first. AXIS_X → w=platlen, h=numtracks; AXIS_Y swaps
+		 * (matches station_cmd.cpp:1454 and React BuildCaptureLayer footprint). */
+		const int w = (axis == AXIS_X) ? static_cast<int>(plat_len) : static_cast<int>(numtracks);
+		const int h = (axis == AXIS_X) ? static_cast<int>(numtracks) : static_cast<int>(plat_len);
+		SctLevelFootprint(tile_a, w, h);
 		CommandCost cost = Command<CMD_BUILD_RAIL_STATION>::Do(
 				DoCommandFlag::Execute, tile_a, rt, axis, numtracks, plat_len,
 				STAT_CLASS_DFLT, 0, StationID::Invalid(), false);
@@ -665,6 +692,7 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 		const DiagDirection dir = (p2 == 255)
 				? SctAutoOrientRailDepot(tile_a)
 				: SctResolveDiagDir(p2);
+		SctLevelFootprint(tile_a, 1, 1); /* Wave 6: single-tile flatten */
 		CommandCost cost = Command<CMD_BUILD_TRAIN_DEPOT>::Do(
 				DoCommandFlag::Execute, tile_a, rt, dir);
 		return dump(SctCostResult(cost));
@@ -707,6 +735,7 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 		const DiagDirection dir = (p2 == 255)
 				? SctAutoOrientRoadDepot(tile_a)
 				: SctResolveDiagDir(p2);
+		SctLevelFootprint(tile_a, 1, 1); /* Wave 6: single-tile flatten */
 		CommandCost cost = Command<CMD_BUILD_ROAD_DEPOT>::Do(
 				DoCommandFlag::Execute, tile_a, rt, dir);
 		return dump(SctCostResult(cost));
@@ -721,6 +750,7 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 
 	if (std::strcmp(action, "airport") == 0) {
 		/* station_cmd.h:26 CmdBuildAirport */
+		SctLevelFootprint(tile_a, 1, 1); /* Wave 6 v1: single-tile flatten then build */
 		CommandCost cost = Command<CMD_BUILD_AIRPORT>::Do(
 				DoCommandFlag::Execute, tile_a,
 				static_cast<uint8_t>(std::clamp(p1, 0, 255)),
