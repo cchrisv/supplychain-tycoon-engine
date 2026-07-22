@@ -48,6 +48,7 @@
 #include "../../direction_type.h"
 #include "../../slope_type.h"
 #include "../../cargo_type.h"
+#include "../../cargotype.h"
 #include "../../network/network_type.h"
 #include "../../viewport_func.h"
 #include "../../window_func.h"
@@ -282,6 +283,20 @@ static nlohmann::json SctQueryGroups()
 			{"name", g->name},
 			{"vehicleType", static_cast<int>(g->vehicle_type)},
 			{"numVehicles", g->statistics.num_vehicle},
+		});
+	}
+	return arr;
+}
+
+static nlohmann::json SctQueryCargos()
+{
+	nlohmann::json arr = nlohmann::json::array();
+	if (!SctInGame()) return arr;
+
+	for (const CargoSpec *cs : CargoSpec::Iterate()) {
+		arr.push_back({
+			{"id", static_cast<int>(cs->Index())},
+			{"name", GetString(cs->name)},
 		});
 	}
 	return arr;
@@ -523,6 +538,8 @@ const char *EMSCRIPTEN_KEEPALIVE sct_query(const char *kind)
 		j = SctQueryEngines();
 	} else if (std::strcmp(kind, "news") == 0) {
 		j = SctQueryNews();
+	} else if (std::strcmp(kind, "cargos") == 0) {
+		j = SctQueryCargos();
 	} else {
 		j = {{"error", "unknown kind"}};
 	}
