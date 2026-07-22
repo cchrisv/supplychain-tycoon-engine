@@ -52,6 +52,8 @@
 #include "../../window_func.h"
 #include "../../window_gui.h"
 #include "../../tile_map.h"
+#include "../../landscape.h"
+#include "../../zoom_func.h"
 #include "../../3rdparty/nlohmann/json.hpp"
 
 #include "table/strings.h"
@@ -518,6 +520,57 @@ const char *EMSCRIPTEN_KEEPALIVE sct_tile_at_screen(int px, int py)
 		{"y", TileY(tile)},
 	};
 	buffer = j.dump();
+	return buffer.c_str();
+}
+
+/**
+ * Map a tile to the 4 screen-pixel corners of its top face (placement highlight).
+ * Forward inverse of TranslateXYToTileCoord (viewport.cpp:430); same canvas transform
+ * as GetViewportStationMiddle (viewport.cpp:3585–3586).
+ * @param tile TileIndex base.
+ * @return JSON `[{"x":sx,"y":sy},...]` (4 corners) or the literal JSON `null`.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_tile_poly(int tile)
+{
+	static std::string buffer;
+
+	if (!SctInGame() || !Map::IsInitialized()) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	if (tile < 0 || static_cast<uint>(tile) >= Map::Size()) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	Window *w = GetMainWindow();
+	if (w == nullptr || w->viewport == nullptr) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	const Viewport &vp = *w->viewport;
+	const TileIndex t{static_cast<uint32_t>(tile)};
+	const int tx = static_cast<int>(TileX(t)) * TILE_SIZE;
+	const int ty = static_cast<int>(TileY(t)) * TILE_SIZE;
+	/* Flat top-face height for v1 (northern corner); fine for placement highlight. */
+	const int z = static_cast<int>(TilePixelHeight(t));
+
+	/* World corners of the tile top face, NW → NE → SE → SW in tile XY. */
+	const int corners_x[4] = { tx, tx + TILE_SIZE, tx + TILE_SIZE, tx };
+	const int corners_y[4] = { ty, ty, ty + TILE_SIZE, ty + TILE_SIZE };
+
+	nlohmann::json arr = nlohmann::json::array();
+	for (int i = 0; i < 4; i++) {
+		Point v = RemapCoords(corners_x[i], corners_y[i], z);
+		/* Reverse of ScaleByZoom(sx - vp.left, zoom) + vp.virtual_left (viewport.cpp:438). */
+		const int sx = UnScaleByZoom(v.x - vp.virtual_left, vp.zoom) + vp.left;
+		const int sy = UnScaleByZoom(v.y - vp.virtual_top, vp.zoom) + vp.top;
+		arr.push_back({{"x", sx}, {"y", sy}});
+	}
+
+	buffer = arr.dump();
 	return buffer.c_str();
 }
 

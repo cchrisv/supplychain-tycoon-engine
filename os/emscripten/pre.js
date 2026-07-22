@@ -9,6 +9,7 @@ Module.sct = (function() {
     var _returnToMenu = null;
     var _query = null;
     var _tileAt = null;
+    var _tilePoly = null;
     var _build = null;
     var _buildVehicle = null;
     var _vehicleCmd = null;
@@ -38,6 +39,11 @@ Module.sct = (function() {
         tileAt: function(px, py) {
             if (!_tileAt) _tileAt = Module.cwrap('sct_tile_at_screen', 'string', ['number', 'number']);
             return JSON.parse(_tileAt(px, py));
+        },
+        tilePoly: function(tile) {
+            if (!_tilePoly) _tilePoly = Module.cwrap('sct_tile_poly', 'string', ['number']);
+            var r = _tilePoly(tile|0);
+            return r ? JSON.parse(r) : null;
         },
         build: function(action, a, b, p1, p2) {
             if (!_build) _build = Module.cwrap('sct_build', 'string', ['string', 'number', 'number', 'number', 'number']);
