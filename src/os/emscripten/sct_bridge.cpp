@@ -810,10 +810,12 @@ const char *EMSCRIPTEN_KEEPALIVE sct_add_order(int vehicle_id, const char *kind,
 		return dump({{"ok", false}, {"error", "unknown kind"}});
 	}
 
-	/* Append: sel_ord == current order count (vehicle_base.h:705 GetNumOrders). */
+	/* Append: sel_ord == current order count (vehicle_base.h:705 GetNumOrders).
+	 * Do() takes (flags, cmd-args...) with no location tile — that prefix is
+	 * only for Post(). CmdInsertOrder args are (veh, sel_ord, order). */
 	const VehicleOrderID sel_ord = v->GetNumOrders();
 	CommandCost cost = Command<CMD_INSERT_ORDER>::Do(
-			DoCommandFlag::Execute, v->tile, VehicleID{static_cast<uint32_t>(vehicle_id)}, sel_ord, o);
+			DoCommandFlag::Execute, VehicleID{static_cast<uint32_t>(vehicle_id)}, sel_ord, o);
 	return dump(SctOkResult(cost));
 }
 
