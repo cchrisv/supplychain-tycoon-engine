@@ -874,6 +874,59 @@ const char *EMSCRIPTEN_KEEPALIVE sct_add_order(int vehicle_id, const char *kind,
 }
 
 /**
+ * Read-back of a vehicle's order list (Wave 4).
+ * @return JSON array of orders, or the literal string "null" if vehicle is invalid.
+ * Schema: [{"index", "type", "dest", "nonstop", "load", "unload"}, ...]
+ * type is "station"|"depot"|"waypoint"|"other"; dest is -1 for "other".
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_vehicle_orders(int vehicle_id)
+{
+	static std::string buffer;
+
+	const Vehicle *v = Vehicle::GetIfValid(vehicle_id);
+	if (v == nullptr) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	nlohmann::json arr = nlohmann::json::array();
+	int index = 0;
+	for (const Order &o : v->Orders()) {
+		const OrderType ot = o.GetType();
+		const char *type_str;
+		int dest;
+		if (ot == OT_GOTO_STATION) {
+			type_str = "station";
+			dest = static_cast<int>(o.GetDestination().base());
+		} else if (ot == OT_GOTO_DEPOT) {
+			type_str = "depot";
+			dest = static_cast<int>(o.GetDestination().base());
+		} else if (ot == OT_GOTO_WAYPOINT) {
+			type_str = "waypoint";
+			dest = static_cast<int>(o.GetDestination().base());
+		} else {
+			type_str = "other";
+			dest = -1;
+		}
+
+		/* GetNonStopType returns OrderNonStopFlags (EnumBitSet) — use .base() for the raw 0–3 bits.
+		 * GetLoadType/GetUnloadType are enum class : uint8_t — static_cast<int> is fine. */
+		arr.push_back({
+			{"index", index},
+			{"type", type_str},
+			{"dest", dest},
+			{"nonstop", static_cast<int>(o.GetNonStopType().base())},
+			{"load", static_cast<int>(o.GetLoadType())},
+			{"unload", static_cast<int>(o.GetUnloadType())},
+		});
+		++index;
+	}
+
+	buffer = arr.dump();
+	return buffer.c_str();
+}
+
+/**
  * Stash build defaults read by sct_build when p1 == 0.
  * Keys: "railtype", "roadtype".
  */
