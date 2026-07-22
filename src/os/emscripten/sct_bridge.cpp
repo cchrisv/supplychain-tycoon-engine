@@ -558,8 +558,9 @@ const char *EMSCRIPTEN_KEEPALIVE sct_tile_poly(int tile)
 	const int z = static_cast<int>(TilePixelHeight(t));
 
 	/* World corners of the tile top face, NW → NE → SE → SW in tile XY. */
-	const int corners_x[4] = { tx, tx + TILE_SIZE, tx + TILE_SIZE, tx };
-	const int corners_y[4] = { ty, ty, ty + TILE_SIZE, ty + TILE_SIZE };
+	const int ts = static_cast<int>(TILE_SIZE);
+	const int corners_x[4] = { tx, tx + ts, tx + ts, tx };
+	const int corners_y[4] = { ty, ty, ty + ts, ty + ts };
 
 	nlohmann::json arr = nlohmann::json::array();
 	for (int i = 0; i < 4; i++) {
