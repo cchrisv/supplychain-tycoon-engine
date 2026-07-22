@@ -696,34 +696,65 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 
 		TileIndex snapped_end = tile_b;
 		Track track = TRACK_X;
+		Track track_alt = INVALID_TRACK; /* sibling half-track to retry with */
+		bool diagonal = false;
 
 		if (p2 != 0 && p2 >= TRACK_BEGIN && p2 < TRACK_END) {
 			/* Explicit track override — keep dragged end tile as-is. */
 			track = static_cast<Track>(p2);
 			snapped_end = tile_b;
 		} else {
-			/* Snap to dominant axis (map_func.h TileX/TileY/TileXY). */
+			/* Wave 12 — snap to the nearest of the EIGHT drag directions:
+			 * tile-axis runs (TRACK_X / TRACK_Y, the screen diagonals) or 45°
+			 * staircase runs built from half-tile tracks (TRACK_UPPER/LOWER for
+			 * screen-horizontal, TRACK_LEFT/RIGHT for screen-vertical drags).
+			 * CmdBuildRailroadTrack alternates the half tracks itself
+			 * (ValidateAutoDrag + the trackdir toggle in its build loop). The
+			 * React BuildCaptureLayer mirrors this exact rule for its preview:
+			 * axis wins when 2*max(|dx|,|dy|) >= 5*min (i.e. within ~22.5° of
+			 * the axis), else staircase of length round((|dx|+|dy|)/2). */
 			const int ax = static_cast<int>(TileX(tile_a));
 			const int ay = static_cast<int>(TileY(tile_a));
 			const int bx = static_cast<int>(TileX(tile_b));
 			const int by = static_cast<int>(TileY(tile_b));
-			const int dx = std::abs(bx - ax);
-			const int dy = std::abs(by - ay);
+			const int dx = bx - ax;
+			const int dy = by - ay;
+			const int adx = std::abs(dx);
+			const int ady = std::abs(dy);
 			const int max_x = static_cast<int>(Map::MaxX());
 			const int max_y = static_cast<int>(Map::MaxY());
 
-			if (dx >= dy) {
-				/* Horizontal line → TRACK_X (track_type.h:21); snap Y to start. */
-				track = TRACK_X;
-				const int end_x = std::clamp(bx, 0, max_x);
-				const int end_y = std::clamp(ay, 0, max_y);
-				snapped_end = TileXY(static_cast<uint>(end_x), static_cast<uint>(end_y));
+			if (2 * std::max(adx, ady) >= 5 * std::min(adx, ady)) {
+				/* Axis-aligned run (track_type.h:21-22). */
+				if (adx >= ady) {
+					track = TRACK_X;
+					snapped_end = TileXY(static_cast<uint>(std::clamp(bx, 0, max_x)),
+							static_cast<uint>(std::clamp(ay, 0, max_y)));
+				} else {
+					track = TRACK_Y;
+					snapped_end = TileXY(static_cast<uint>(std::clamp(ax, 0, max_x)),
+							static_cast<uint>(std::clamp(by, 0, max_y)));
+				}
 			} else {
-				/* Vertical line → TRACK_Y (track_type.h:22); snap X to start. */
-				track = TRACK_Y;
-				const int end_x = std::clamp(ax, 0, max_x);
-				const int end_y = std::clamp(by, 0, max_y);
+				/* 45° staircase. Which half (upper/lower, left/right) the run
+				 * starts with depends on sub-tile grab position we don't have,
+				 * so try one and fall back to its sibling. */
+				diagonal = true;
+				const int sx = dx >= 0 ? 1 : -1;
+				const int sy = dy >= 0 ? 1 : -1;
+				const int n = (adx + ady + 1) / 2;
+				const int end_x = std::clamp(ax + n * sx, 0, max_x);
+				const int end_y = std::clamp(ay + n * sy, 0, max_y);
 				snapped_end = TileXY(static_cast<uint>(end_x), static_cast<uint>(end_y));
+				if (sx == sy) {
+					/* Screen-vertical (x and y move together). */
+					track = TRACK_LEFT;
+					track_alt = TRACK_RIGHT;
+				} else {
+					/* Screen-horizontal (x and y move opposite). */
+					track = TRACK_UPPER;
+					track_alt = TRACK_LOWER;
+				}
 			}
 		}
 
@@ -732,12 +763,29 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 			return dump({{"ok", false}, {"error", "invalid tile"}, {"cost", 0}});
 		}
 
-		/* Auto-flatten the line first (terraform_cmd.h:18 CmdLevelLand).
-		 * Inside AutoRestoreBackup company block; ignore result (already flat / no funds). */
-		(void)Command<CMD_LEVEL_LAND>::Do(DoCommandFlag::Execute, snapped_end, tile_a, false, LM_LEVEL);
+		/* Auto-flatten axis runs first (terraform_cmd.h:18 CmdLevelLand — the
+		 * rect between the endpoints IS the line there). For staircase runs the
+		 * rect would be n×n tiles, so try the build on natural terrain first
+		 * and only level-then-retry when it fails. */
+		if (!diagonal) {
+			(void)Command<CMD_LEVEL_LAND>::Do(DoCommandFlag::Execute, snapped_end, tile_a, false, LM_LEVEL);
+		}
 
 		CommandCost cost = Command<CMD_BUILD_RAILROAD_TRACK>::Do(
 				DoCommandFlag::Execute, snapped_end, tile_a, rt, track, true, false);
+		if (cost.Failed() && track_alt != INVALID_TRACK) {
+			cost = Command<CMD_BUILD_RAILROAD_TRACK>::Do(
+					DoCommandFlag::Execute, snapped_end, tile_a, rt, track_alt, true, false);
+		}
+		if (cost.Failed() && diagonal) {
+			(void)Command<CMD_LEVEL_LAND>::Do(DoCommandFlag::Execute, snapped_end, tile_a, false, LM_LEVEL);
+			cost = Command<CMD_BUILD_RAILROAD_TRACK>::Do(
+					DoCommandFlag::Execute, snapped_end, tile_a, rt, track, true, false);
+			if (cost.Failed() && track_alt != INVALID_TRACK) {
+				cost = Command<CMD_BUILD_RAILROAD_TRACK>::Do(
+						DoCommandFlag::Execute, snapped_end, tile_a, rt, track_alt, true, false);
+			}
+		}
 		return dump(SctCostResult(cost));
 	}
 

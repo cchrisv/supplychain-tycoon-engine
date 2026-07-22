@@ -2501,6 +2501,13 @@ extern bool _sct_native_viewport_windows;
 
 bool HandleViewportClicked(const Viewport &vp, int x, int y)
 {
+#ifdef __EMSCRIPTEN__
+	/* React owns viewport clicks: no native place tools, sign editors, or
+	 * landscape/vehicle windows (SetObjectToPlace is gated too, so the
+	 * place-mode branches below can never arm in the first place). */
+	if (!_sct_native_viewport_windows) return false;
+#endif
+
 	const Vehicle *v = CheckClickOnVehicle(vp, x, y);
 
 	if (_thd.place_mode & HT_VEHICLE) {
@@ -2512,11 +2519,6 @@ bool HandleViewportClicked(const Viewport &vp, int x, int y)
 		PlaceObject();
 		return true;
 	}
-
-#ifdef __EMSCRIPTEN__
-	/* React owns idle clicks: no native sign/landscape/vehicle windows. */
-	if (!_sct_native_viewport_windows) return false;
-#endif
 
 	if (CheckClickOnViewportSign(vp, x, y)) return true;
 	bool result = CheckClickOnLandscape(vp, x, y);
@@ -3536,6 +3538,13 @@ void SetObjectToPlaceWnd(CursorID icon, PaletteID pal, HighLightStyle mode, Wind
  */
 void SetObjectToPlace(CursorID icon, PaletteID pal, HighLightStyle mode, WindowClass window_class, WindowNumber window_num)
 {
+#ifdef __EMSCRIPTEN__
+	/* React owns build interactions in this fork: never arm the native place
+	 * tools (drag highlight + native build clicks), which stray hotkeys could
+	 * otherwise trigger. HT_NONE must pass through — it is how
+	 * ResetObjectToPlace clears an armed tool. */
+	if (!_sct_native_viewport_windows && mode != HT_NONE) return;
+#endif
 	if (_thd.window_class != WC_INVALID) {
 		/* Undo clicking on button and drag & drop */
 		Window *w = _thd.GetCallbackWnd();
