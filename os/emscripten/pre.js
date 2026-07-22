@@ -1,4 +1,32 @@
 Module.arguments.push('-mnull', '-snull', '-vsdl');
+
+/* Supplychain Tycoon external-UI bridge.
+ * cwrap must not run before the runtime is ready; wrap lazily on first call. */
+Module.sct = (function() {
+    var _exec = null;
+    var _getState = null;
+    var _setFastForward = null;
+    var _returnToMenu = null;
+    return {
+        exec: function(cmd) {
+            if (!_exec) _exec = Module.cwrap('sct_console_exec', null, ['string']);
+            return _exec(cmd);
+        },
+        getState: function() {
+            if (!_getState) _getState = Module.cwrap('sct_get_state', 'string', []);
+            return JSON.parse(_getState());
+        },
+        setFastForward: function(on) {
+            if (!_setFastForward) _setFastForward = Module.cwrap('sct_set_fast_forward', null, ['number']);
+            return _setFastForward(on ? 1 : 0);
+        },
+        returnToMenu: function() {
+            if (!_returnToMenu) _returnToMenu = Module.cwrap('sct_return_to_menu', null, []);
+            return _returnToMenu();
+        },
+    };
+})();
+
 Module['websocket'] = { url: function(host, port, proto) {
     /* openttd.org hosts a WebSocket proxy for the content service. */
     if (host == "content.openttd.org" && port == 3978 && proto == "tcp") {
