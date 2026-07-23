@@ -73,6 +73,9 @@ Module.sct = (function() {
     var _setNativeClick = null;
     var _content = null;
     var _startEditor = null;
+    var _newgrfSelect = null;
+    var _setLabels = null;
+    var _labels = null;
     return {
         exec: function(cmd) {
             if (!_exec) _exec = Module.cwrap('sct_console_exec', null, ['string']);
@@ -97,6 +100,15 @@ Module.sct = (function() {
         tileAt: function(px, py) {
             if (!_tileAt) _tileAt = Module.cwrap('sct_tile_at_screen', 'string', ['number', 'number']);
             return JSON.parse(_tileAt(px, py));
+        },
+        setLabels: function(mask) {
+            if (!_setLabels) _setLabels = Module.cwrap('sct_set_labels', null, ['number']);
+            return _setLabels(mask|0);
+        },
+        labels: function() {
+            if (!_labels) _labels = Module.cwrap('sct_labels', 'string', []);
+            var r = _labels();
+            return r ? JSON.parse(r) : null;
         },
         tilePoly: function(tile) {
             if (!_tilePoly) _tilePoly = Module.cwrap('sct_tile_poly', 'string', ['number']);
@@ -279,6 +291,10 @@ Module.sct = (function() {
             if (!_startEditor) _startEditor = Module.cwrap('sct_start_editor', 'string', []);
             var r = _startEditor();
             return r ? JSON.parse(r) : null;
+        },
+        newgrfSelect: function(grfidHex, md5Hex, on) {
+            if (!_newgrfSelect) _newgrfSelect = Module.cwrap('sct_newgrf_select', 'string', ['string', 'string', 'number']);
+            return JSON.parse(_newgrfSelect(String(grfidHex), md5Hex == null ? '' : String(md5Hex), on ? 1 : 0));
         },
     };
 })();

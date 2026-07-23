@@ -62,6 +62,8 @@
 #include "../../settings_type.h"
 #include "../../core/random_func.hpp"
 #include "../../newgrf_station.h"
+#include "../../newgrf_config.h"
+#include "../../string_func.h"
 #include "../../rail.h"
 #include "../../road_func.h"
 #include "../../track_type.h"
@@ -86,6 +88,8 @@
 #include "../../landscape.h"
 #include "../../zoom_func.h"
 #include "../../viewport_type.h"
+#include "../../viewport_kdtree.h"
+#include "../../signs_base.h"
 #include "../../object_cmd.h"
 #include "../../object_type.h"
 #include "../../cheat_type.h"
@@ -424,6 +428,20 @@ static nlohmann::json SctQueryIndustryTypes()
 		if (spec->name != STR_NULL && spec->name != INVALID_STRING_ID) {
 			entry["name"] = GetString(spec->name);
 		}
+
+		/* Wave 21 — cargo the type accepts / produces (industrytype.h: fixed-size
+		 * accepts_cargo / produced_cargo arrays padded with INVALID_CARGO). */
+		nlohmann::json accepts = nlohmann::json::array();
+		for (CargoType c : spec->accepts_cargo) {
+			if (IsValidCargoType(c)) accepts.push_back(static_cast<int>(c));
+		}
+		nlohmann::json produces = nlohmann::json::array();
+		for (CargoType c : spec->produced_cargo) {
+			if (IsValidCargoType(c)) produces.push_back(static_cast<int>(c));
+		}
+		entry["accepts"] = std::move(accepts);
+		entry["produces"] = std::move(produces);
+
 		arr.push_back(std::move(entry));
 	}
 	return arr;
@@ -527,6 +545,13 @@ static nlohmann::json SctQueryInfrastructure()
 static int g_sct_railtype = 0;
 /** Default roadtype for build commands when p1 == 0 (0 = auto-pick first available). */
 static int g_sct_roadtype = 0;
+/**
+ * Wave 21 — per-placement station-join stash consumed by the rail_station build.
+ * -1 (default) = force a fresh station (NEW_STATION, adjacent=false); 0 = allow
+ * adjacent placement (station_to_join = Invalid, adjacent=true); >0 = distant-join
+ * that concrete StationID (adjacent=false). Reset to -1 after every station build.
+ */
+static int g_sct_station_join = -1;
 
 static bool SctCanBuild()
 {
@@ -733,13 +758,93 @@ static nlohmann::json SctQueryNetworkStatus()
 	};
 }
 
+/**
+ * Wave 21 — every company in the pool (real + AI). Drives the league table and
+ * buy-company windows. Fields are the cheap cached ones plus a live company value.
+ * `performance` is the same score the league window sorts on
+ * (old_economy[0].performance_history, 0-1000). `vehicles` sums the ALL_GROUP
+ * per-type caches (company_base.h group_all[], NOSAVE). `value` is a live
+ * CalculateCompanyValue(c) (company_base.h:198) — O(assets) per company, fine for
+ * the handful of companies that ever exist. money/loan are doubles so JS keeps
+ * full magnitude without BigInt.
+ */
+static nlohmann::json SctQueryCompanies()
+{
+	nlohmann::json arr = nlohmann::json::array();
+	if (!SctInGame()) return arr;
+
+	for (const Company *c : Company::Iterate()) {
+		std::string name = c->name.empty()
+				? fmt::format("Company {}", c->index.base() + 1)
+				: c->name;
+
+		uint32_t vehicles = 0;
+		for (VehicleType vt = VEH_BEGIN; vt < VEH_COMPANY_END; vt++) {
+			vehicles += c->group_all[vt].num_vehicle;
+		}
+
+		arr.push_back({
+			{"id", c->index.base()},
+			{"name", std::move(name)},
+			{"money", static_cast<double>(c->money)},
+			{"loan", static_cast<double>(c->current_loan)},
+			{"value", static_cast<double>(CalculateCompanyValue(c))},
+			{"isAI", c->is_ai},
+			{"vehicles", vehicles},
+			{"performance", c->old_economy[0].performance_history},
+		});
+	}
+	return arr;
+}
+
+/** True if `list` already holds a GRFConfig matching grfid (and md5 when non-null). */
+static bool SctGrfInList(const GRFConfigList &list, uint32_t grfid, const MD5Hash *md5)
+{
+	for (const auto &c : list) {
+		if (c->ident.HasGrfIdentifier(grfid, md5)) return true;
+	}
+	return false;
+}
+
+/**
+ * Wave 21 — every NewGRF the engine has scanned (newgrf_config.h _all_grfs,
+ * populated by ScanNewGRFFiles). grfid is the canonical 8-hex-char display form
+ * (std::byteswap of the stored little-endian grfid, exactly as console_cmds.cpp
+ * prints it); md5 is the uppercase 32-char hex of the file checksum. `selected`
+ * flags whether a matching entry is currently in _grfconfig_newgame (so new games
+ * would start with it). If no scan has run yet this session (_all_grfs empty),
+ * request one the way the GUI/console does (RequestNewGRFScan runs on the next
+ * game-tick, openttd.cpp:1327) and return [] for the caller to poll.
+ */
+static nlohmann::json SctQueryNewgrfAvailable()
+{
+	nlohmann::json arr = nlohmann::json::array();
+
+	if (_all_grfs.empty()) {
+		RequestNewGRFScan();
+		return arr;
+	}
+
+	for (const auto &c : _all_grfs) {
+		arr.push_back({
+			{"grfid", fmt::format("{:08X}", std::byteswap(c->ident.grfid))},
+			{"md5", FormatArrayAsHex(c->ident.md5sum)},
+			{"filename", c->filename},
+			{"name", c->GetName()},
+			{"status", static_cast<int>(c->status)},
+			{"selected", SctGrfInList(_grfconfig_newgame, c->ident.grfid, &c->ident.md5sum)},
+		});
+	}
+	return arr;
+}
+
 } // namespace
 
 /**
  * Query entity data for the external UI.
  * @param kind Null-terminated query kind (towns, industries, stations, vehicles, groups,
  *             financeDetail, engines, news, cargos, companyEconomy, industryTypes,
- *             infrastructure, contentList, networkStatus).
+ *             infrastructure, contentList, networkStatus, companies, newgrfAvailable).
  * @return Pointer to a static JSON string buffer (valid until the next call to this or sct_get_state).
  */
 const char *EMSCRIPTEN_KEEPALIVE sct_query(const char *kind)
@@ -777,6 +882,10 @@ const char *EMSCRIPTEN_KEEPALIVE sct_query(const char *kind)
 		j = SctQueryContentList();
 	} else if (std::strcmp(kind, "networkStatus") == 0) {
 		j = SctQueryNetworkStatus();
+	} else if (std::strcmp(kind, "companies") == 0) {
+		j = SctQueryCompanies();
+	} else if (std::strcmp(kind, "newgrfAvailable") == 0) {
+		j = SctQueryNewgrfAvailable();
 	} else {
 		j = {{"error", "unknown kind"}};
 	}
@@ -874,6 +983,151 @@ const char *EMSCRIPTEN_KEEPALIVE sct_tile_poly(int tile)
 	}
 
 	buffer = arr.dump();
+	return buffer.c_str();
+}
+
+/**
+ * Show / hide the engine's own viewport name signs.
+ *
+ * Every viewport sign is gated by _display_opt (transparency.h) and read in one
+ * place, ViewportAddKdtreeSigns (viewport.cpp); clearing the bits stops the
+ * engine drawing them without touching the draw path. The React label layer
+ * (sct_labels below) renders its own plates instead.
+ *
+ * @param mask Bit 0 towns, 1 stations, 2 waypoints, 3 signs. 0 = hide all.
+ */
+void EMSCRIPTEN_KEEPALIVE sct_set_labels(int mask)
+{
+	auto apply = [&](int bit, uint8_t opt) {
+		if (HasBit(static_cast<uint>(mask), bit)) {
+			SetBit(_display_opt, opt);
+		} else {
+			ClrBit(_display_opt, opt);
+		}
+	};
+
+	apply(0, DO_SHOW_TOWN_NAMES);
+	apply(1, DO_SHOW_STATION_NAMES);
+	apply(2, DO_SHOW_WAYPOINT_NAMES);
+	apply(3, DO_SHOW_SIGNS);
+
+	MarkWholeScreenDirty();
+}
+
+/**
+ * List the name labels visible in the main viewport, in canvas pixels.
+ *
+ * Mirrors ViewportAddKdtreeSigns (viewport.cpp) — same kdtree query, same
+ * facility / competitor filtering — but ignores the four name bits of
+ * _display_opt so the React layer keeps working while the native signs are
+ * hidden via sct_set_labels(0). Screen mapping is the transform used by
+ * sct_tile_poly above.
+ *
+ * @return JSON `{"vp":{"left","top","zoom","virtualLeft","virtualTop"},
+ *          "labels":[{"type","id","name","x","y","w","owner"}]}`, or `null`.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_labels()
+{
+	static std::string buffer;
+
+	if (!SctInGame() || !Map::IsInitialized()) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	Window *w = GetMainWindow();
+	if (w == nullptr || w->viewport == nullptr) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	const Viewport &vp = *w->viewport;
+	const bool small = vp.zoom >= ZoomLevel::Out4x;
+
+	/* Search the sign kdtree over the visible virtual rect, expanded so signs
+	 * whose anchor sits just off-screen but whose text overlaps still appear.
+	 * (ExpandRectWithViewportSignMargins is static in viewport.cpp; the margins
+	 * here are a generous fixed equivalent — the kdtree does the real work.) */
+	const int expand_x = ScaleByZoom(192, vp.zoom);
+	const int expand_y = ScaleByZoom(32, vp.zoom);
+	const int left = vp.virtual_left - expand_x;
+	const int top = vp.virtual_top - expand_y;
+	const int right = vp.virtual_left + vp.virtual_width + expand_x;
+	const int bottom = vp.virtual_top + vp.virtual_height + expand_y;
+
+	const bool show_competitors = HasBit(_display_opt, DO_SHOW_COMPETITOR_SIGNS);
+
+	nlohmann::json labels = nlohmann::json::array();
+
+	auto emit = [&](const char *type, uint32_t id, const std::string &name, const ViewportSign &sign, Owner owner) {
+		labels.push_back({
+			{"type", type},
+			{"id", id},
+			{"name", name},
+			{"x", UnScaleByZoom(sign.center - vp.virtual_left, vp.zoom) + vp.left},
+			{"y", UnScaleByZoom(sign.top - vp.virtual_top, vp.zoom) + vp.top},
+			{"w", small ? sign.width_small : sign.width_normal},
+			{"owner", owner.base()},
+		});
+	};
+
+	_viewport_sign_kdtree.FindContained(left, top, right, bottom, [&](const ViewportSignKdtreeItem &item) {
+		switch (item.type) {
+			case ViewportSignKdtreeItem::VKI_STATION:
+			case ViewportSignKdtreeItem::VKI_WAYPOINT: {
+				const BaseStation *st = BaseStation::Get(std::get<StationID>(item.id));
+				const bool is_waypoint = (item.type == ViewportSignKdtreeItem::VKI_WAYPOINT);
+
+				if (!is_waypoint) {
+					/* No facilities at all means a ghost station. */
+					StationFacilities facilities = st->facilities;
+					if (facilities.None()) facilities = STATION_FACILITY_GHOST;
+					if (!facilities.Any(_facility_display_opt)) break;
+				}
+
+				/* Competitor-owned names follow the same toggle as the engine;
+				 * OWNER_NONE stations are never hidden. */
+				if (!show_competitors && _local_company != st->owner && st->owner != OWNER_NONE) break;
+
+				emit(is_waypoint ? "waypoint" : "station", std::get<StationID>(item.id).base(),
+						st->GetCachedName(), st->sign, st->owner);
+				break;
+			}
+
+			case ViewportSignKdtreeItem::VKI_TOWN: {
+				const Town *t = Town::Get(std::get<TownID>(item.id));
+				emit("town", std::get<TownID>(item.id).base(), t->GetCachedName(), t->cache.sign, OWNER_NONE);
+				break;
+			}
+
+			case ViewportSignKdtreeItem::VKI_SIGN: {
+				const Sign *si = Sign::Get(std::get<SignID>(item.id));
+				/* Matches the engine: competitor signs (incl. OWNER_NONE leftovers
+				 * from bankrupt companies) hide with the same toggle. */
+				if (!show_competitors && _local_company != si->owner && si->owner != OWNER_DEITY) break;
+				emit("sign", std::get<SignID>(item.id).base(), si->name, si->sign, si->owner);
+				break;
+			}
+
+			default:
+				break;
+		}
+	});
+
+	nlohmann::json j = {
+		{"vp", {
+			{"left", vp.left},
+			{"top", vp.top},
+			{"width", vp.width},
+			{"height", vp.height},
+			{"zoom", static_cast<int>(vp.zoom)},
+			{"virtualLeft", vp.virtual_left},
+			{"virtualTop", vp.virtual_top},
+		}},
+		{"labels", labels},
+	};
+
+	buffer = j.dump();
 	return buffer.c_str();
 }
 
@@ -1021,9 +1275,31 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 		const int w = (axis == AXIS_X) ? static_cast<int>(plat_len) : static_cast<int>(numtracks);
 		const int h = (axis == AXIS_X) ? static_cast<int>(numtracks) : static_cast<int>(plat_len);
 		SctLevelFootprint(tile_a, w, h);
+
+		/* Wave 21 — per-placement join semantics from the stashed stationJoin param
+		 * (station_cmd.cpp:1465 reuse/distant_join logic; rail_gui.cpp:217-223 GUI
+		 * path). -1 = fresh station (NEW_STATION, adjacent=false); 0 = adjacent
+		 * placement allowed (Invalid + adjacent=true); >0 = distant-join that
+		 * StationID (adjacent=false, needs station.distant_join_stations enabled).
+		 * The stash is consumed here and reset to -1 so it never leaks to the next
+		 * placement. */
+		StationID station_to_join;
+		bool adjacent;
+		if (g_sct_station_join < 0) {
+			station_to_join = NEW_STATION;
+			adjacent = false;
+		} else if (g_sct_station_join == 0) {
+			station_to_join = StationID::Invalid();
+			adjacent = true;
+		} else {
+			station_to_join = StationID{static_cast<uint16_t>(g_sct_station_join)};
+			adjacent = false;
+		}
+		g_sct_station_join = -1;
+
 		CommandCost cost = Command<CMD_BUILD_RAIL_STATION>::Do(
 				DoCommandFlag::Execute, tile_a, rt, axis, numtracks, plat_len,
-				STAT_CLASS_DFLT, 0, StationID::Invalid(), false);
+				STAT_CLASS_DFLT, 0, station_to_join, adjacent);
 		return dump(SctCostResult(cost));
 	}
 
@@ -1067,6 +1343,37 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 		const Axis axis = (TileY(tile_a) != TileY(tile_b)) ? AXIS_Y : AXIS_X;
 		CommandCost cost = Command<CMD_BUILD_LONG_ROAD>::Do(
 				DoCommandFlag::Execute, tile_b, tile_a, rt, axis, DRD_NONE, false, false, false);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "one_way_road") == 0) {
+		/* Wave 21 — build road then flag one-way, mirroring the "road" action with a
+		 * disallowed-direction set. p1 = roadtype (as "road"); p2 selects the
+		 * DisallowedRoadDirections (road_type.h): default/<=0 → DRD_NORTHBOUND (the GUI
+		 * one-way default, road_gui.cpp:756), 2 → DRD_SOUTHBOUND, 3 → DRD_BOTH.
+		 * Constraint: one-way state only lives on straight full-tile road pieces and
+		 * a one-way road may not form a junction (road_cmd.cpp:643-645), so this is a
+		 * straight-run tool only. Single tile uses CmdBuildRoad's toggle_drd (XOR): a
+		 * fresh straight piece (DRD_NONE) toggles to the requested drd; re-issuing on
+		 * the same tile toggles it back off. Drags use CmdBuildLongRoad's drd param. */
+		const RoadType rt = SctResolveRoadType(p1);
+		DisallowedRoadDirections drd = DRD_NORTHBOUND;
+		if (p2 == static_cast<int>(DRD_SOUTHBOUND)) drd = DRD_SOUTHBOUND;
+		else if (p2 == static_cast<int>(DRD_BOTH)) drd = DRD_BOTH;
+
+		if (a == b || !IsValidTile(tile_b) || tile_a == tile_b) {
+			/* Single straight tile: road_cmd.h:26 CmdBuildRoad(tile, ROAD_X, rt, toggle_drd, town). */
+			CommandCost cost = Command<CMD_BUILD_ROAD>::Do(
+					DoCommandFlag::Execute, tile_a, ROAD_X, rt, drd, TownID::Invalid());
+			return dump(SctCostResult(cost));
+		}
+		if (TileX(tile_a) != TileX(tile_b) && TileY(tile_a) != TileY(tile_b)) {
+			return dump({{"ok", false}, {"error", "road not axis-aligned"}, {"cost", 0}});
+		}
+		/* Drag: road_cmd.h:24 CmdBuildLongRoad(end, start, rt, axis, drd, start_half, end_half, is_ai). */
+		const Axis axis = (TileY(tile_a) != TileY(tile_b)) ? AXIS_Y : AXIS_X;
+		CommandCost cost = Command<CMD_BUILD_LONG_ROAD>::Do(
+				DoCommandFlag::Execute, tile_b, tile_a, rt, axis, drd, false, false, false);
 		return dump(SctCostResult(cost));
 	}
 
@@ -2779,8 +3086,10 @@ const char *EMSCRIPTEN_KEEPALIVE sct_industry_detail(int industry_id)
 }
 
 /**
- * Stash build defaults read by sct_build when p1 == 0.
- * Keys: "railtype", "roadtype".
+ * Stash build defaults read by sct_build.
+ * Keys: "railtype", "roadtype" (used when p1 == 0), "stationjoin" (Wave 21 — the
+ * next rail_station placement's join semantics: -1 fresh / 0 adjacent / >0 join
+ * that StationID; consumed and reset to -1 by the build).
  */
 void EMSCRIPTEN_KEEPALIVE sct_set_build_param(const char *key, int value)
 {
@@ -2790,6 +3099,8 @@ void EMSCRIPTEN_KEEPALIVE sct_set_build_param(const char *key, int value)
 		g_sct_railtype = value;
 	} else if (strcasecmp(key, "roadtype") == 0) {
 		g_sct_roadtype = value;
+	} else if (strcasecmp(key, "stationjoin") == 0) {
+		g_sct_station_join = value;
 	}
 }
 
@@ -2879,6 +3190,82 @@ const char *EMSCRIPTEN_KEEPALIVE sct_start_editor()
 	nlohmann::json j = {{"ok", true}};
 	buffer = j.dump();
 	return buffer.c_str();
+}
+
+/**
+ * Wave 21 — add (`on` != 0) or remove (`on` == 0) a NewGRF from the new-game config
+ * (_grfconfig_newgame). `grfid_hex` is the 8-hex-char canonical grfid string this
+ * bridge emits from query('newgrfAvailable') (i.e. std::byteswap of the stored
+ * little-endian grfid). `md5_hex` is optional (nullptr / "" = match by grfid alone);
+ * when given it must be the 32-char hex checksum to disambiguate multiple versions of
+ * the same grfid.
+ *
+ * Add: find the matching GRFConfig in _all_grfs, deep-copy it the way the GRF
+ * settings GUI does (std::make_unique<GRFConfig>(*src) + SetParameterDefaults(),
+ * newgrf_gui.cpp:1486) and append via AppendToGRFConfigList(_grfconfig_newgame, …).
+ * A no-op {ok:true} when an entry is already present. Remove: erase every matching
+ * entry from _grfconfig_newgame.
+ *
+ * New games pick these up because the newgame path copies _grfconfig_newgame.
+ * Cross-session persistence is via the normal SaveConfig path — settings.cpp:1522
+ * serialises _grfconfig_newgame into the config's [newgrf] section — so no explicit
+ * save is issued here (matching the GUI, which relies on the same save-on-exit path).
+ *
+ * @return {ok, error}. Not gated on being in-game: NewGRF config is a menu action.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_newgrf_select(const char *grfid_hex, const char *md5_hex, int on)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (grfid_hex == nullptr || grfid_hex[0] == '\0') {
+		return dump({{"ok", false}, {"error", "missing grfid"}});
+	}
+
+	/* Parse the canonical display grfid back to the stored little-endian form. */
+	const uint32_t display_grfid = static_cast<uint32_t>(std::strtoul(grfid_hex, nullptr, 16));
+	const uint32_t grfid = std::byteswap(display_grfid);
+
+	const bool have_md5 = (md5_hex != nullptr && md5_hex[0] != '\0');
+
+	/* Locate the matching scanned GRFConfig. md5 (when supplied) is compared as the
+	 * uppercase hex string this bridge emits, so no byte parsing is needed. */
+	const GRFConfig *match = nullptr;
+	for (const auto &c : _all_grfs) {
+		if (c->ident.grfid != grfid) continue;
+		if (have_md5 && !StrEqualsIgnoreCase(FormatArrayAsHex(c->ident.md5sum), md5_hex)) continue;
+		match = c.get();
+		break;
+	}
+
+	if (on != 0) {
+		if (match == nullptr) {
+			return dump({{"ok", false}, {"error", "grf not found"}});
+		}
+		/* Already present → idempotent success. */
+		if (SctGrfInList(_grfconfig_newgame, grfid, have_md5 ? &match->ident.md5sum : nullptr)) {
+			return dump({{"ok", true}, {"error", std::string{}}});
+		}
+		auto copy = std::make_unique<GRFConfig>(*match);
+		copy->SetParameterDefaults();
+		AppendToGRFConfigList(_grfconfig_newgame, std::move(copy));
+		return dump({{"ok", true}, {"error", std::string{}}});
+	}
+
+	/* on == 0: remove every matching entry from the new-game config. */
+	const MD5Hash *md5_filter = (have_md5 && match != nullptr) ? &match->ident.md5sum : nullptr;
+	const size_t removed = std::erase_if(_grfconfig_newgame,
+			[&](const std::unique_ptr<GRFConfig> &c) {
+				return c->ident.HasGrfIdentifier(grfid, md5_filter);
+			});
+	if (removed == 0) {
+		return dump({{"ok", false}, {"error", "not selected"}});
+	}
+	return dump({{"ok", true}, {"error", std::string{}}});
 }
 
 } /* extern "C" */
