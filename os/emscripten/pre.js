@@ -51,6 +51,8 @@ Module.sct = (function() {
     var _townDetail = null;
     var _industryDetail = null;
     var _setNativeClick = null;
+    var _content = null;
+    var _startEditor = null;
     return {
         exec: function(cmd) {
             if (!_exec) _exec = Module.cwrap('sct_console_exec', null, ['string']);
@@ -247,6 +249,16 @@ Module.sct = (function() {
         setNativeClick: function(on) {
             if (!_setNativeClick) _setNativeClick = Module.cwrap('sct_set_native_click', null, ['number']);
             return _setNativeClick(on ? 1 : 0);
+        },
+        content: function(action, id) {
+            if (!_content) _content = Module.cwrap('sct_content', 'string', ['string', 'number']);
+            var r = _content(action, id|0);
+            return r ? JSON.parse(r) : null;
+        },
+        startEditor: function() {
+            if (!_startEditor) _startEditor = Module.cwrap('sct_start_editor', 'string', []);
+            var r = _startEditor();
+            return r ? JSON.parse(r) : null;
         },
     };
 })();

@@ -70,6 +70,8 @@
 #include "../../cargo_type.h"
 #include "../../cargotype.h"
 #include "../../network/network_type.h"
+#include "../../network/network_content.h"
+#include "../../genworld.h"
 #include "../../viewport_func.h"
 #include "../../window_func.h"
 #include "../../window_gui.h"
@@ -653,13 +655,91 @@ static void SctLevelFootprint(TileIndex origin, int width, int height)
 	(void)Command<CMD_LEVEL_LAND>::Do(DoCommandFlag::Execute, end_tile, origin, false, LM_LEVEL);
 }
 
+/* ---- Wave 18: network content service (BaNaNaS) ---- */
+
+/** Map a ContentType (tcp_content_type.h) to a short lower-snake string for the UI. */
+static const char *SctContentTypeStr(ContentType t)
+{
+	switch (t) {
+		case CONTENT_TYPE_BASE_GRAPHICS: return "base_graphics";
+		case CONTENT_TYPE_NEWGRF:        return "newgrf";
+		case CONTENT_TYPE_AI:            return "ai";
+		case CONTENT_TYPE_AI_LIBRARY:    return "library";
+		case CONTENT_TYPE_SCENARIO:      return "scenario";
+		case CONTENT_TYPE_HEIGHTMAP:     return "heightmap";
+		case CONTENT_TYPE_BASE_SOUNDS:   return "base_sounds";
+		case CONTENT_TYPE_BASE_MUSIC:    return "base_music";
+		case CONTENT_TYPE_GAME:          return "game_script";
+		case CONTENT_TYPE_GAME_LIBRARY:  return "library";
+		default:                         return "unknown";
+	}
+}
+
+/** Map a ContentInfo::State (tcp_content_type.h) to a short lower-snake string. */
+static const char *SctContentStateStr(ContentInfo::State s)
+{
+	switch (s) {
+		case ContentInfo::State::Unselected:   return "unselected";
+		case ContentInfo::State::Selected:     return "selected";
+		case ContentInfo::State::Autoselected: return "autoselected";
+		case ContentInfo::State::AlreadyHere:  return "already_here";
+		case ContentInfo::State::DoesNotExist: return "does_not_exist";
+		case ContentInfo::State::Invalid:      return "invalid";
+		default:                               return "invalid";
+	}
+}
+
+/**
+ * Wave 18 — the network content client's known items (BaNaNaS). Iterates
+ * `_network_content_client.Info()` (network_content.h — a read-only view of the
+ * received ContentInfo list). Returns [] before `content update` has fetched a
+ * list (the infos vector is empty then). Independent of game mode — content can
+ * be browsed from the menu.
+ */
+static nlohmann::json SctQueryContentList()
+{
+	nlohmann::json arr = nlohmann::json::array();
+	for (const ContentInfo &ci : _network_content_client.Info()) {
+		nlohmann::json entry = {
+			{"id", static_cast<int64_t>(ci.id)},
+			{"type", SctContentTypeStr(ci.type)},
+			{"name", ci.name},
+			{"filesize", static_cast<int64_t>(ci.filesize)},
+			{"state", SctContentStateStr(ci.state)},
+		};
+		if (!ci.version.empty()) entry["version"] = ci.version;
+		if (!ci.url.empty()) entry["url"] = ci.url;
+		if (!ci.description.empty()) entry["description"] = ci.description;
+		arr.push_back(std::move(entry));
+	}
+	return arr;
+}
+
+/**
+ * Wave 18 — network reachability snapshot for the UI. `contentConnected` is
+ * whether the content client currently holds an open socket
+ * (NetworkTCPSocketHandler::IsConnected, tcp.h:45). The game coordinator / server
+ * listing is not surfaced: multiplayer server browsing is not built in this fork
+ * and the coordinator client's game list is not cheaply/reliably reachable over
+ * the emscripten WebSocket proxy, so `serverList` is always [] with an explanatory
+ * `note` (see the Wave 18 contract section). No server browsing is implemented.
+ */
+static nlohmann::json SctQueryNetworkStatus()
+{
+	return {
+		{"contentConnected", _network_content_client.IsConnected()},
+		{"serverList", nlohmann::json::array()},
+		{"note", "coordinator unavailable: server browsing not built in this emscripten fork"},
+	};
+}
+
 } // namespace
 
 /**
  * Query entity data for the external UI.
  * @param kind Null-terminated query kind (towns, industries, stations, vehicles, groups,
  *             financeDetail, engines, news, cargos, companyEconomy, industryTypes,
- *             infrastructure).
+ *             infrastructure, contentList, networkStatus).
  * @return Pointer to a static JSON string buffer (valid until the next call to this or sct_get_state).
  */
 const char *EMSCRIPTEN_KEEPALIVE sct_query(const char *kind)
@@ -693,6 +773,10 @@ const char *EMSCRIPTEN_KEEPALIVE sct_query(const char *kind)
 		j = SctQueryIndustryTypes();
 	} else if (std::strcmp(kind, "infrastructure") == 0) {
 		j = SctQueryInfrastructure();
+	} else if (std::strcmp(kind, "contentList") == 0) {
+		j = SctQueryContentList();
+	} else if (std::strcmp(kind, "networkStatus") == 0) {
+		j = SctQueryNetworkStatus();
 	} else {
 		j = {{"error", "unknown kind"}};
 	}
@@ -2716,6 +2800,85 @@ void EMSCRIPTEN_KEEPALIVE sct_set_build_param(const char *key, int value)
 void EMSCRIPTEN_KEEPALIVE sct_set_native_click(int on)
 {
 	_sct_native_viewport_windows = on != 0;
+}
+
+/**
+ * Wave 18 — drive the network content service (BaNaNaS), mirroring the console
+ * `content update|select|unselect|download` command (console_cmds.cpp ConContent).
+ * All calls go through `_network_content_client` (network_content.h). No AutoRestore
+ * backup: content is company-independent. Actions:
+ *   "update"   → RequestContentList(CONTENT_TYPE_END) — fetch the full downloadable
+ *                list (connects to the content server itself; must run before the
+ *                list is populated, exactly like the console `content update`).
+ *   "select"   → Select((ContentID)id).
+ *   "unselect" → Unselect((ContentID)id).
+ *   "download" → DownloadSelectedContent(files, bytes) — downloads everything
+ *                currently selected (same call the console `content download` makes;
+ *                no separate connect step — `update` already connected). Reports the
+ *                queued file/byte counts.
+ * @return {ok, error} (plus files/bytes on a successful "download").
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_content(const char *action, int id)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (action == nullptr) {
+		return dump({{"ok", false}, {"error", "unknown action"}});
+	}
+
+	if (std::strcmp(action, "update") == 0) {
+		/* CONTENT_TYPE_END = "all types", the console default (console_cmds.cpp). */
+		_network_content_client.RequestContentList(CONTENT_TYPE_END);
+		return dump({{"ok", true}, {"error", std::string{}}});
+	}
+
+	if (std::strcmp(action, "select") == 0) {
+		_network_content_client.Select(static_cast<ContentID>(id));
+		return dump({{"ok", true}, {"error", std::string{}}});
+	}
+
+	if (std::strcmp(action, "unselect") == 0) {
+		_network_content_client.Unselect(static_cast<ContentID>(id));
+		return dump({{"ok", true}, {"error", std::string{}}});
+	}
+
+	if (std::strcmp(action, "download") == 0) {
+		uint files = 0;
+		uint bytes = 0;
+		_network_content_client.DownloadSelectedContent(files, bytes);
+		return dump({
+			{"ok", true},
+			{"error", std::string{}},
+			{"files", static_cast<int>(files)},
+			{"bytes", static_cast<int64_t>(bytes)},
+		});
+	}
+
+	return dump({{"ok", false}, {"error", "unknown action"}});
+}
+
+/**
+ * Wave 18 — enter the scenario editor from the menu, the way the intro screen's
+ * "Scenario Editor" button does (intro_gui.cpp WID_SGI_EDIT_SCENARIO →
+ * StartScenarioEditor, genworld.h). StartScenarioEditor() runs the real GUI path
+ * (genworld_gui.cpp StartGeneratingLandscape(GLWM_SCENARIO): close non-vital
+ * windows, MakeNewgameSettingsLive, ResetGRFConfig, then `_switch_mode = SM_EDITOR`),
+ * so on the next tick SwitchToMode builds a fresh editor world (openttd.cpp:1065
+ * MakeNewEditorWorld) and the mode actually starts.
+ * @return {ok}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_start_editor()
+{
+	static std::string buffer;
+	StartScenarioEditor();
+	nlohmann::json j = {{"ok", true}};
+	buffer = j.dump();
+	return buffer.c_str();
 }
 
 } /* extern "C" */
