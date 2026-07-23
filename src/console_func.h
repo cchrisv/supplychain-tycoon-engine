@@ -13,6 +13,11 @@
 #include "console_type.h"
 #include "core/format.hpp"
 
+#ifdef __EMSCRIPTEN__
+#include <vector>
+#include <string>
+#endif /* __EMSCRIPTEN__ */
+
 /* console modes */
 extern IConsoleModes _iconsole_mode;
 
@@ -47,6 +52,13 @@ inline void IConsolePrint(TextColour colour_code, fmt::format_string<A, Args...>
 
 /* Parser */
 void IConsoleCmdExec(std::string_view command_string, const uint recurse_count = 0);
+
+#ifdef __EMSCRIPTEN__
+/* Supplychain Tycoon bridge: copy the most recent console backlog lines into `out`
+ * (oldest -> newest, capped at max_lines). Implemented in console_gui.cpp where the
+ * file-local `_iconsole_buffer` lives. */
+void SctGetConsoleBacklog(int max_lines, std::vector<std::string> &out);
+#endif /* __EMSCRIPTEN__ */
 
 bool IsValidConsoleColour(TextColour c);
 

@@ -83,6 +83,17 @@
 #include "../../town_map.h"
 #include "../../landscape.h"
 #include "../../zoom_func.h"
+#include "../../viewport_type.h"
+#include "../../object_cmd.h"
+#include "../../object_type.h"
+#include "../../cheat_type.h"
+#include "../../transparency.h"
+#include "../../water.h"
+#include "../../station_func.h"
+#include "../../rail_gui.h"
+#include "../../economy_func.h"
+#include "../../linkgraph/linkgraphschedule.h"
+#include "../../timer/timer_game_economy.h"
 #include "../../3rdparty/nlohmann/json.hpp"
 
 #include "table/strings.h"
@@ -100,6 +111,10 @@
  * (viewport.cpp); toggleable at runtime through sct_set_native_click below
  * for debugging against stock behaviour. */
 bool _sct_native_viewport_windows = false;
+
+/* Defined in engine.cpp; refreshes engine availability caches after a date jump.
+ * Declared extern here exactly as cheat_gui.cpp does (no public header). */
+extern void CalendarEnginesMonthlyLoop();
 
 extern "C" {
 
@@ -458,6 +473,52 @@ static nlohmann::json SctQueryCompanyEconomy()
 	return arr;
 }
 
+static nlohmann::json SctQueryInfrastructure()
+{
+	/* Wave 16 — local company infrastructure counts (company_base.h
+	 * CompanyInfrastructure, a NOSAVE cache the engine keeps up to date). rail/road
+	 * are the per-type track-bit totals summed across all rail/road types
+	 * (GetRailTotal / GetRoadTotal); water/station/airport/signal are direct counts.
+	 * `maintenance` mirrors the infra-maintenance accumulation in economy.cpp:657-669
+	 * (the raw sum the engine subtracts while `economy.infrastructure_maintenance` is
+	 * on); omitted when that setting is off (then nothing is charged). */
+	if (!SctInGame()) return nullptr;
+
+	const Company *c = Company::GetIfValid(_local_company);
+	if (c == nullptr) return nullptr;
+
+	const CompanyInfrastructure &inf = c->infrastructure;
+	nlohmann::json j = {
+		{"rail", inf.GetRailTotal()},
+		{"road", inf.GetRoadTotal()},
+		{"tram", inf.GetTramTotal()},
+		{"water", inf.water},
+		{"station", inf.station},
+		{"airport", inf.airport},
+		{"signal", inf.signal},
+	};
+
+	if (_settings_game.economy.infrastructure_maintenance) {
+		Money cost = 0;
+		const uint32_t rail_total = inf.GetRailTotal();
+		for (RailType rt = RAILTYPE_BEGIN; rt < RAILTYPE_END; rt++) {
+			if (inf.rail[rt] != 0) cost += RailMaintenanceCost(rt, inf.rail[rt], rail_total);
+		}
+		cost += SignalMaintenanceCost(inf.signal);
+		const uint32_t road_total = inf.GetRoadTotal();
+		const uint32_t tram_total = inf.GetTramTotal();
+		for (RoadType rt = ROADTYPE_BEGIN; rt < ROADTYPE_END; rt++) {
+			if (inf.road[rt] != 0) cost += RoadMaintenanceCost(rt, inf.road[rt], RoadTypeIsRoad(rt) ? road_total : tram_total);
+		}
+		cost += CanalMaintenanceCost(inf.water);
+		cost += StationMaintenanceCost(inf.station);
+		cost += AirportMaintenanceCost(c->index);
+		j["maintenance"] = static_cast<int64_t>(cost);
+	}
+
+	return j;
+}
+
 /* ---- Write-bridge helpers (build / place / vehicle commands) ---- */
 
 /** Default railtype for build commands when p1 == 0 (0 = auto-pick first available). */
@@ -597,7 +658,8 @@ static void SctLevelFootprint(TileIndex origin, int width, int height)
 /**
  * Query entity data for the external UI.
  * @param kind Null-terminated query kind (towns, industries, stations, vehicles, groups,
- *             financeDetail, engines, news, cargos, companyEconomy, industryTypes).
+ *             financeDetail, engines, news, cargos, companyEconomy, industryTypes,
+ *             infrastructure).
  * @return Pointer to a static JSON string buffer (valid until the next call to this or sct_get_state).
  */
 const char *EMSCRIPTEN_KEEPALIVE sct_query(const char *kind)
@@ -629,6 +691,8 @@ const char *EMSCRIPTEN_KEEPALIVE sct_query(const char *kind)
 		j = SctQueryCompanyEconomy();
 	} else if (std::strcmp(kind, "industryTypes") == 0) {
 		j = SctQueryIndustryTypes();
+	} else if (std::strcmp(kind, "infrastructure") == 0) {
+		j = SctQueryInfrastructure();
 	} else {
 		j = {{"error", "unknown kind"}};
 	}
@@ -2203,6 +2267,431 @@ const char *EMSCRIPTEN_KEEPALIVE sct_timetable_start(int vehicle_id, int ticks_f
 	CommandCost cost = Command<CMD_SET_TIMETABLE_START>::Do(
 			DoCommandFlag::Execute, vid, false, start_tick);
 	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 16 — zoom the main viewport (mirrors the toolbar zoom buttons).
+ * dir > 0 zooms in, dir < 0 zooms out, dir == 0 is a no-op. Runs
+ * DoZoomInOutWindow(ZOOM_IN/ZOOM_OUT, GetMainWindow()) (viewport_func.h:33; the
+ * exact call toolbar_gui.cpp:860/870 makes). `ok` reflects whether the zoom level
+ * actually changed (false when already at the min/max zoom limit).
+ * @return {ok}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_zoom(int dir)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctInGame() || !Map::IsInitialized()) {
+		return dump({{"ok", false}});
+	}
+	if (dir == 0) {
+		return dump({{"ok", true}});
+	}
+
+	Window *w = GetMainWindow();
+	if (w == nullptr || w->viewport == nullptr) {
+		return dump({{"ok", false}});
+	}
+
+	const bool ok = DoZoomInOutWindow(dir > 0 ? ZOOM_IN : ZOOM_OUT, w);
+	return dump({{"ok", ok}});
+}
+
+/**
+ * Wave 16 — most-recent console backlog lines, oldest -> newest, capped at
+ * maxLines. Reads the in-game console's `_iconsole_buffer` (console_gui.cpp) via
+ * the SctGetConsoleBacklog accessor (console_func.h); that buffer holds the newest
+ * line at index 0, so the accessor reverses the kept slice.
+ * @return JSON array of strings (possibly empty).
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_console_output(int max_lines)
+{
+	static std::string buffer;
+
+	std::vector<std::string> lines;
+	SctGetConsoleBacklog(max_lines, lines);
+
+	nlohmann::json arr = nlohmann::json::array();
+	for (const std::string &s : lines) arr.push_back(s);
+
+	buffer = arr.dump();
+	return buffer.c_str();
+}
+
+/**
+ * Wave 16 — rename a vehicle group. Empty name resets to the default.
+ * group_cmd.h CmdAlterGroup(flags, AlterGroupMode::Rename, group_id, parent, text).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_rename_group(int group_id, const char *name)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const GroupID gid{static_cast<uint16_t>(group_id)};
+	if (!Group::IsValidID(gid)) {
+		return dump({{"ok", false}, {"error", "invalid group"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_ALTER_GROUP>::Do(
+			DoCommandFlag::Execute, AlterGroupMode::Rename, gid, GroupID::Invalid(),
+			std::string{name == nullptr ? "" : name});
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 16 — delete a vehicle group. group_cmd.h CmdDeleteGroup(flags, group_id).
+ * Vehicles in the group move back to the default group (engine behaviour).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_delete_group(int group_id)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const GroupID gid{static_cast<uint16_t>(group_id)};
+	if (!Group::IsValidID(gid)) {
+		return dump({{"ok", false}, {"error", "invalid group"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_DELETE_GROUP>::Do(DoCommandFlag::Execute, gid);
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 16 — toggle a group's autoreplace-protection flag. protect != 0 sets it
+ * (global autoreplace no longer touches the group), == 0 clears it. group_cmd.h
+ * CmdSetGroupFlag(flags, group_id, GroupFlag::ReplaceProtection, value, recursive);
+ * recursive is fixed false (this group only, matching the non-ctrl GUI click,
+ * group_gui.cpp:907).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_protect_group(int group_id, int protect)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const GroupID gid{static_cast<uint16_t>(group_id)};
+	if (!Group::IsValidID(gid)) {
+		return dump({{"ok", false}, {"error", "invalid group"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_SET_GROUP_FLAG>::Do(
+			DoCommandFlag::Execute, gid, GroupFlag::ReplaceProtection, protect != 0, false);
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 16 — buy a single tile of land (the "purchase land" tool). In 15.3 owned
+ * land is an object, so this is object_cmd.h CmdBuildObject(flags, tile,
+ * OBJECT_OWNED_LAND, view=0) (object_type.h:21; terraform_gui.cpp:283 uses the
+ * area variant, this is the single-tile case). Runs as the local company.
+ * @return {ok, error, cost}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_buy_land(int tile)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}, {"cost", 0}});
+	}
+
+	const TileIndex t{static_cast<uint32_t>(tile)};
+	if (!IsValidTile(t)) {
+		return dump({{"ok", false}, {"error", "invalid tile"}, {"cost", 0}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_BUILD_OBJECT>::Do(
+			DoCommandFlag::Execute, t, OBJECT_OWNED_LAND, static_cast<uint8_t>(0));
+	return dump(SctCostResult(cost));
+}
+
+/**
+ * Wave 16 — apply the year part of the change-date cheat. Replicates the essential
+ * half of cheat_gui.cpp:107 ClickChangeDateCheat: clamp the year, move the calendar
+ * date (keeping month/day), keep the economy date in sync when not using wallclock
+ * units (shifting cached vehicle / link-graph dates first), then refresh engine
+ * availability and signal-variant caches. The native-window invalidations from the
+ * GUI path are intentionally omitted (React owns the UI in this fork).
+ */
+static void SctChangeDateCheatYear(int year)
+{
+	const TimerGameCalendar::Year new_year = Clamp(
+			TimerGameCalendar::Year(year), CalendarTime::MIN_YEAR, CalendarTime::MAX_YEAR);
+	if (new_year == TimerGameCalendar::year) return;
+
+	TimerGameCalendar::YearMonthDay ymd = TimerGameCalendar::ConvertDateToYMD(TimerGameCalendar::date);
+	const TimerGameCalendar::Date new_calendar_date =
+			TimerGameCalendar::ConvertYMDToDate(new_year, ymd.month, ymd.day);
+	TimerGameCalendar::SetDate(new_calendar_date, TimerGameCalendar::date_fract);
+
+	if (!TimerGameEconomy::UsingWallclockUnits()) {
+		const TimerGameEconomy::Date new_economy_date{new_calendar_date.base()};
+		for (auto v : Vehicle::Iterate()) v->ShiftDates(new_economy_date - TimerGameEconomy::date);
+		LinkGraphSchedule::instance.ShiftDates(new_economy_date - TimerGameEconomy::date);
+		TimerGameEconomy::SetDate(new_economy_date, TimerGameEconomy::date_fract);
+	}
+
+	CalendarEnginesMonthlyLoop();
+	ResetSignalVariant();
+}
+
+/**
+ * Wave 16 — apply a cheat. kind:
+ *   "money"           → misc_cmd.h CMD_MONEY_CHEAT with a (Money)value delta.
+ *   "magic_bulldozer" → _cheats.magic_bulldozer.value = value != 0 (dynamite anything).
+ *   "crossing_tunnels"→ _cheats.crossing_tunnels.value = value != 0.
+ *   "no_jetcrash"     → _cheats.no_jetcrash.value = value != 0.
+ *   "date"            → change the calendar year to (int)value (see SctChangeDateCheatYear).
+ * Bool cheats also mark been_used, exactly like the cheat GUI. Unknown kind → error.
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_cheat(const char *kind, double value)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (kind == nullptr) {
+		return dump({{"ok", false}, {"error", "unknown cheat"}});
+	}
+	if (!SctInGame()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	if (std::strcmp(kind, "money") == 0) {
+		if (!Company::IsValidID(_local_company)) {
+			return dump({{"ok", false}, {"error", "no company"}});
+		}
+		AutoRestoreBackup backup(_current_company, _local_company);
+		_cheats.money.been_used = true;
+		CommandCost cost = Command<CMD_MONEY_CHEAT>::Do(
+				DoCommandFlag::Execute, static_cast<Money>(value));
+		return dump(SctOkResult(cost));
+	}
+
+	if (std::strcmp(kind, "magic_bulldozer") == 0) {
+		_cheats.magic_bulldozer.value = (value != 0);
+		_cheats.magic_bulldozer.been_used = true;
+		return dump({{"ok", true}, {"error", std::string{}}});
+	}
+	if (std::strcmp(kind, "crossing_tunnels") == 0) {
+		_cheats.crossing_tunnels.value = (value != 0);
+		_cheats.crossing_tunnels.been_used = true;
+		return dump({{"ok", true}, {"error", std::string{}}});
+	}
+	if (std::strcmp(kind, "no_jetcrash") == 0) {
+		_cheats.no_jetcrash.value = (value != 0);
+		_cheats.no_jetcrash.been_used = true;
+		return dump({{"ok", true}, {"error", std::string{}}});
+	}
+	if (std::strcmp(kind, "date") == 0) {
+		_cheats.change_date.been_used = true;
+		SctChangeDateCheatYear(static_cast<int>(value));
+		return dump({{"ok", true}, {"error", std::string{}}});
+	}
+
+	return dump({{"ok", false}, {"error", "unknown cheat"}});
+}
+
+/**
+ * Wave 16 — set or clear a transparency option bit in _transparency_opt
+ * (transparency.h TransparencyOption). option strings map: "signs"→TO_SIGNS,
+ * "trees"→TO_TREES, "houses"→TO_HOUSES, "industries"→TO_INDUSTRIES,
+ * "buildings"→TO_BUILDINGS, "bridges"→TO_BRIDGES, "structures"→TO_STRUCTURES,
+ * "catenary"→TO_CATENARY, "loading"→TO_TEXT (loading + cost/income text). on != 0
+ * sets the bit, == 0 clears it; then MarkWholeScreenDirty() so the change shows.
+ * Unknown option → {ok:false}.
+ * @return {ok}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_set_transparency(const char *option, int on)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (option == nullptr) {
+		return dump({{"ok", false}});
+	}
+
+	TransparencyOption to = TO_INVALID;
+	if (std::strcmp(option, "signs") == 0) to = TO_SIGNS;
+	else if (std::strcmp(option, "trees") == 0) to = TO_TREES;
+	else if (std::strcmp(option, "houses") == 0) to = TO_HOUSES;
+	else if (std::strcmp(option, "industries") == 0) to = TO_INDUSTRIES;
+	else if (std::strcmp(option, "buildings") == 0) to = TO_BUILDINGS;
+	else if (std::strcmp(option, "bridges") == 0) to = TO_BRIDGES;
+	else if (std::strcmp(option, "structures") == 0) to = TO_STRUCTURES;
+	else if (std::strcmp(option, "catenary") == 0) to = TO_CATENARY;
+	else if (std::strcmp(option, "loading") == 0) to = TO_TEXT;
+
+	if (to == TO_INVALID) {
+		return dump({{"ok", false}});
+	}
+
+	if (on != 0) {
+		SetBit(_transparency_opt, to);
+	} else {
+		ClrBit(_transparency_opt, to);
+	}
+	MarkWholeScreenDirty();
+
+	return dump({{"ok", true}});
+}
+
+/**
+ * Wave 16 — detail for one town (town.h Town). Fields are the cheaply-cached ones:
+ *   population   cache.population
+ *   houses       cache.num_houses
+ *   growthRate   growth_rate ticks between house grows; null when growth is disabled
+ *                (TOWN_GROWTH_RATE_NONE)
+ *   rating       local company's town rating (int16), or null if it has none yet
+ *   passMax      max passengers delivered to the town last month (received[TAE_PASSENGERS].old_max)
+ *   mailMax      max mail delivered to the town last month (received[TAE_MAIL].old_max)
+ *   cargoAccepted per-town-effect delivery stats with a non-zero last-month max:
+ *                [{effect:<TownAcceptanceEffect 1..5>, max:<old_max>, transported:<old_act>}]
+ * Note: this fork's Town keeps production in a `supplied` vector keyed by cargo and
+ * deliveries in the TAE-indexed `received` array; passMax/mailMax/cargoAccepted are
+ * read from `received` (cargo delivered to the town) — the cheap, exact data.
+ * @return JSON object, or the literal "null" for an invalid town.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_town_detail(int town_id)
+{
+	static std::string buffer;
+
+	const Town *t = Town::GetIfValid(town_id);
+	if (t == nullptr) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	nlohmann::json j;
+	j["population"] = t->cache.population;
+	j["houses"] = t->cache.num_houses;
+	j["growthRate"] = (t->growth_rate == TOWN_GROWTH_RATE_NONE)
+			? nlohmann::json(nullptr)
+			: nlohmann::json(t->growth_rate);
+
+	if (Company::IsValidID(_local_company) && t->have_ratings.Test(_local_company)) {
+		j["rating"] = t->ratings[_local_company];
+	} else {
+		j["rating"] = nullptr;
+	}
+
+	j["passMax"] = t->received[TAE_PASSENGERS].old_max;
+	j["mailMax"] = t->received[TAE_MAIL].old_max;
+
+	nlohmann::json accepted = nlohmann::json::array();
+	for (int tae = TAE_BEGIN + 1; tae < TAE_END; tae++) {
+		const auto &stat = t->received[tae];
+		if (stat.old_max == 0) continue;
+		accepted.push_back({
+			{"effect", tae},
+			{"max", stat.old_max},
+			{"transported", stat.old_act},
+		});
+	}
+	j["cargoAccepted"] = std::move(accepted);
+
+	buffer = j.dump();
+	return buffer.c_str();
+}
+
+/**
+ * Wave 16 — detail for one industry (industry.h Industry). Shape:
+ *   {type, typeName?, produced:[{cargo, lastMonthProduction, lastMonthTransported}],
+ *    accepts:[cargo, ...]}
+ * `produced` iterates the industry's produced-cargo slots (each with a 25-month
+ * HistoryData; LAST_MONTH is the previous month). `accepts` lists the accepted
+ * cargo-type ids. Invalid/empty cargo slots are skipped.
+ * @return JSON object, or the literal "null" for an invalid industry.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_industry_detail(int industry_id)
+{
+	static std::string buffer;
+
+	const Industry *ind = Industry::GetIfValid(industry_id);
+	if (ind == nullptr) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	nlohmann::json j;
+	j["type"] = ind->type;
+
+	const IndustrySpec *spec = GetIndustrySpec(ind->type);
+	if (spec != nullptr && spec->name != STR_NULL && spec->name != INVALID_STRING_ID) {
+		j["typeName"] = GetString(spec->name);
+	}
+
+	nlohmann::json produced = nlohmann::json::array();
+	for (const auto &p : ind->produced) {
+		if (!IsValidCargoType(p.cargo)) continue;
+		produced.push_back({
+			{"cargo", static_cast<int>(p.cargo)},
+			{"lastMonthProduction", p.history[LAST_MONTH].production},
+			{"lastMonthTransported", p.history[LAST_MONTH].transported},
+		});
+	}
+	j["produced"] = std::move(produced);
+
+	nlohmann::json accepts = nlohmann::json::array();
+	for (const auto &a : ind->accepted) {
+		if (!IsValidCargoType(a.cargo)) continue;
+		accepts.push_back(static_cast<int>(a.cargo));
+	}
+	j["accepts"] = std::move(accepts);
+
+	buffer = j.dump();
+	return buffer.c_str();
 }
 
 /**

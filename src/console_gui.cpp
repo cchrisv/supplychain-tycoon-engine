@@ -71,6 +71,27 @@ static std::deque<IConsoleLine> _iconsole_buffer;
 
 static bool TruncateBuffer();
 
+#ifdef __EMSCRIPTEN__
+/**
+ * Supplychain Tycoon bridge accessor: copy the most recent console backlog lines
+ * into `out`, ordered oldest -> newest, capped at `max_lines`. `_iconsole_buffer`
+ * stores the newest line at index 0, so we walk it back-to-front.
+ * @param max_lines Maximum number of lines to return (<= 0 yields none).
+ * @param out       Destination vector (cleared first).
+ */
+void SctGetConsoleBacklog(int max_lines, std::vector<std::string> &out)
+{
+	out.clear();
+	if (max_lines <= 0) return;
+	const size_t count = std::min(static_cast<size_t>(max_lines), _iconsole_buffer.size());
+	out.reserve(count);
+	/* Emit oldest -> newest: index count-1 is the oldest of the kept slice. */
+	for (size_t i = count; i-- > 0;) {
+		out.push_back(_iconsole_buffer[i].buffer);
+	}
+}
+#endif /* __EMSCRIPTEN__ */
+
 class ConsoleAutoCompletion final : public AutoCompletion {
 public:
 	using AutoCompletion::AutoCompletion;

@@ -40,6 +40,16 @@ Module.sct = (function() {
     var _timetable = null;
     var _autofillTimetable = null;
     var _timetableStart = null;
+    var _zoom = null;
+    var _consoleOutput = null;
+    var _renameGroup = null;
+    var _deleteGroup = null;
+    var _protectGroup = null;
+    var _buyLand = null;
+    var _cheat = null;
+    var _setTransparency = null;
+    var _townDetail = null;
+    var _industryDetail = null;
     var _setNativeClick = null;
     return {
         exec: function(cmd) {
@@ -191,6 +201,48 @@ Module.sct = (function() {
         timetableStart: function(vehicleId, ticksFromNow) {
             if (!_timetableStart) _timetableStart = Module.cwrap('sct_timetable_start', 'string', ['number', 'number']);
             return JSON.parse(_timetableStart(vehicleId|0, ticksFromNow|0));
+        },
+        zoom: function(dir) {
+            if (!_zoom) _zoom = Module.cwrap('sct_zoom', 'string', ['number']);
+            return JSON.parse(_zoom(dir|0));
+        },
+        consoleOutput: function(maxLines) {
+            if (!_consoleOutput) _consoleOutput = Module.cwrap('sct_console_output', 'string', ['number']);
+            return JSON.parse(_consoleOutput(maxLines === undefined ? 100 : maxLines|0));
+        },
+        renameGroup: function(groupId, name) {
+            if (!_renameGroup) _renameGroup = Module.cwrap('sct_rename_group', 'string', ['number', 'string']);
+            return JSON.parse(_renameGroup(groupId|0, name == null ? '' : String(name)));
+        },
+        deleteGroup: function(groupId) {
+            if (!_deleteGroup) _deleteGroup = Module.cwrap('sct_delete_group', 'string', ['number']);
+            return JSON.parse(_deleteGroup(groupId|0));
+        },
+        protectGroup: function(groupId, protect) {
+            if (!_protectGroup) _protectGroup = Module.cwrap('sct_protect_group', 'string', ['number', 'number']);
+            return JSON.parse(_protectGroup(groupId|0, protect ? 1 : 0));
+        },
+        buyLand: function(tile) {
+            if (!_buyLand) _buyLand = Module.cwrap('sct_buy_land', 'string', ['number']);
+            return JSON.parse(_buyLand(tile|0));
+        },
+        cheat: function(kind, value) {
+            if (!_cheat) _cheat = Module.cwrap('sct_cheat', 'string', ['string', 'number']);
+            return JSON.parse(_cheat(String(kind), Number(value) || 0));
+        },
+        setTransparency: function(option, on) {
+            if (!_setTransparency) _setTransparency = Module.cwrap('sct_set_transparency', 'string', ['string', 'number']);
+            return JSON.parse(_setTransparency(String(option), on ? 1 : 0));
+        },
+        townDetail: function(townId) {
+            if (!_townDetail) _townDetail = Module.cwrap('sct_town_detail', 'string', ['number']);
+            var r = _townDetail(townId|0);
+            return r ? JSON.parse(r) : null;
+        },
+        industryDetail: function(industryId) {
+            if (!_industryDetail) _industryDetail = Module.cwrap('sct_industry_detail', 'string', ['number']);
+            var r = _industryDetail(industryId|0);
+            return r ? JSON.parse(r) : null;
         },
         setNativeClick: function(on) {
             if (!_setNativeClick) _setNativeClick = Module.cwrap('sct_set_native_click', null, ['number']);
