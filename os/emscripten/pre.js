@@ -74,6 +74,9 @@ Module.sct = (function() {
     var _content = null;
     var _startEditor = null;
     var _newgrfSelect = null;
+    var _saveScenario = null;
+    var _expandTown = null;
+    var _stationCatchment = null;
     var _setLabels = null;
     var _labels = null;
     return {
@@ -295,6 +298,19 @@ Module.sct = (function() {
         newgrfSelect: function(grfidHex, md5Hex, on) {
             if (!_newgrfSelect) _newgrfSelect = Module.cwrap('sct_newgrf_select', 'string', ['string', 'string', 'number']);
             return JSON.parse(_newgrfSelect(String(grfidHex), md5Hex == null ? '' : String(md5Hex), on ? 1 : 0));
+        },
+        saveScenario: function(name) {
+            if (!_saveScenario) _saveScenario = Module.cwrap('sct_save_scenario', 'string', ['string']);
+            return JSON.parse(_saveScenario(name == null ? '' : String(name)));
+        },
+        expandTown: function(townId, cells) {
+            if (!_expandTown) _expandTown = Module.cwrap('sct_expand_town', 'string', ['number', 'number']);
+            return JSON.parse(_expandTown(townId|0, cells === undefined ? 0 : cells|0));
+        },
+        stationCatchment: function(stationId) {
+            if (!_stationCatchment) _stationCatchment = Module.cwrap('sct_station_catchment', 'string', ['number']);
+            var r = _stationCatchment(stationId|0);
+            return r ? JSON.parse(r) : null;
         },
     };
 })();

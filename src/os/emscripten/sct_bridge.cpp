@@ -100,12 +100,17 @@
 #include "../../economy_func.h"
 #include "../../linkgraph/linkgraphschedule.h"
 #include "../../timer/timer_game_economy.h"
+#include "../../saveload/saveload.h"
+#include "../../fileio_type.h"
+#include "../../fileio_func.h"
+#include "../../town_type.h"
 #include "../../3rdparty/nlohmann/json.hpp"
 
 #include "table/strings.h"
 
 #include <emscripten.h>
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <string>
 #include <strings.h>
@@ -121,6 +126,12 @@ bool _sct_native_viewport_windows = false;
 /* Defined in engine.cpp; refreshes engine availability caches after a date jump.
  * Declared extern here exactly as cheat_gui.cpp does (no public header). */
 extern void CalendarEnginesMonthlyLoop();
+
+/* Defined in industry_gui.cpp; when true the scenario editor's industry-build path
+ * bypasses the normal placement restrictions (industry_cmd.cpp:1327). Declared extern
+ * here exactly as industry_cmd.cpp does (no public header). Wave 22 uses it to mirror
+ * the SE "build industry" tool. */
+extern bool _ignore_industry_restrictions;
 
 extern "C" {
 
@@ -556,6 +567,47 @@ static int g_sct_station_join = -1;
 static bool SctCanBuild()
 {
 	return SctInGame() && Map::IsInitialized() && Company::IsValidID(_local_company);
+}
+
+/**
+ * Wave 22 — gate for landscape / town / industry edits, which are legal both in a
+ * normal game (with a valid local company) AND in the scenario editor (GM_EDITOR,
+ * where _local_company is OWNER_NONE so no real company exists). This is distinct
+ * from SctCanBuild, which gates company-only construction (rail/road/stations/
+ * vehicles) and still demands a valid company — those actions stay refused in the
+ * editor exactly as before.
+ */
+static bool SctCanEditLandscape()
+{
+	if (!Map::IsInitialized()) return false;
+	if (_game_mode == GM_EDITOR) return true;
+	return _game_mode == GM_NORMAL && Company::IsValidID(_local_company);
+}
+
+/**
+ * Wave 22 — acting company for a scenario-editor landscape / town / industry edit.
+ *
+ * The scenario-editor GUI dispatches every one of these tools as OWNER_NONE — its
+ * local company in the editor. industry_gui.cpp:716 backs _current_company to
+ * OWNER_NONE explicitly before CMD_BUILD_INDUSTRY; the terraform toolbar
+ * (terraform_gui.cpp) and the found-town tool (town_gui.cpp) run under the same
+ * OWNER_NONE local company that openttd.cpp sets with SetLocalCompany(OWNER_NONE)
+ * when the editor starts.
+ *
+ * We deliberately use OWNER_NONE and NOT OWNER_DEITY: OWNER_DEITY is the
+ * game-script / deity owner and takes different code paths (e.g. industry
+ * random/prospect-creation instead of user-creation, and different town-rating and
+ * cleared-land ownership handling). Matching the SE GUI means OWNER_NONE.
+ *
+ * In a normal game this simply returns _local_company, so every existing write path
+ * keeps identical behaviour. (Note _local_company already equals OWNER_NONE in the
+ * editor, so this is also what the old AutoRestoreBackup(_current_company,
+ * _local_company) produced — but SctCanBuild refused to reach it there; the real fix
+ * is the gate above.)
+ */
+static CompanyID SctActingCompany()
+{
+	return (_game_mode == GM_EDITOR) ? OWNER_NONE : _local_company;
 }
 
 static std::string SctErrorFromCost(const CommandCost &cost)
@@ -1152,11 +1204,25 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 	if (action == nullptr) {
 		return dump({{"ok", false}, {"error", "unknown action"}, {"cost", 0}});
 	}
-	if (!SctCanBuild()) {
+
+	/* Wave 22 — terraform / clear are landscape edits the scenario editor legitimately
+	 * performs, so they use the editor-aware gate (works in GM_EDITOR too). Every other
+	 * action here is company construction and keeps the SctCanBuild (valid-company)
+	 * gate, so it still refuses in the editor exactly as before. */
+	const bool is_landscape_edit =
+			std::strcmp(action, "terrain_up") == 0 ||
+			std::strcmp(action, "terrain_down") == 0 ||
+			std::strcmp(action, "terrain_level") == 0 ||
+			std::strcmp(action, "demolish") == 0;
+
+	if (is_landscape_edit ? !SctCanEditLandscape() : !SctCanBuild()) {
 		return dump({{"ok", false}, {"error", "not in game"}, {"cost", 0}});
 	}
 
-	AutoRestoreBackup backup(_current_company, _local_company);
+	/* In a normal game SctActingCompany() == _local_company (identical to the old
+	 * behaviour for every company action); in the editor it is OWNER_NONE, matching
+	 * the SE terraform / clear tools. */
+	AutoRestoreBackup backup(_current_company, SctActingCompany());
 
 	const TileIndex tile_a{static_cast<uint32_t>(a)};
 	const TileIndex tile_b{static_cast<uint32_t>(b)};
@@ -2413,7 +2479,11 @@ const char *EMSCRIPTEN_KEEPALIVE sct_found_town(int tile, int size, int city_lay
 		return buffer.c_str();
 	};
 
-	if (!SctCanBuild()) {
+	/* Wave 22 — founding a town is a legitimate scenario-editor action, so use the
+	 * editor-aware gate. In the editor this runs as OWNER_NONE (SctActingCompany),
+	 * matching the SE found-town tool; in a normal game it stays the local company
+	 * (a player-founded town, obeying economy.found_town). */
+	if (!SctCanEditLandscape()) {
 		return dump({{"ok", false}, {"error", "not in game"}, {"id", -1}, {"cost", 0}});
 	}
 
@@ -2422,7 +2492,7 @@ const char *EMSCRIPTEN_KEEPALIVE sct_found_town(int tile, int size, int city_lay
 		return dump({{"ok", false}, {"error", "invalid tile"}, {"id", -1}, {"cost", 0}});
 	}
 
-	AutoRestoreBackup backup(_current_company, _local_company);
+	AutoRestoreBackup backup(_current_company, SctActingCompany());
 
 	const TownSize ts = (size >= 0 && size < TSZ_END) ? static_cast<TownSize>(size) : TSZ_SMALL;
 	/* Use the configured layout so the player-founding layout check passes; city_layout
@@ -2463,12 +2533,35 @@ const char *EMSCRIPTEN_KEEPALIVE sct_fund_industry(int tile, int industry_type, 
 		return buffer.c_str();
 	};
 
-	if (!SctCanBuild()) {
+	/* Wave 22 — building an industry is a legitimate scenario-editor action. */
+	if (!SctCanEditLandscape()) {
 		return dump({{"ok", false}, {"error", "not in game"}, {"cost", 0}});
 	}
 
 	const IndustryType it = static_cast<IndustryType>(industry_type);
 	const uint32_t seed = _interactive_random.Next();
+
+	/* Wave 22 — in the scenario editor, mirror the SE "build industry" tool
+	 * (industry_gui.cpp:708-720): act as OWNER_NONE with _generating_world and
+	 * _ignore_industry_restrictions set so the normal placement restrictions are
+	 * bypassed, then build (fund=false) at the clicked tile with a random layout. The
+	 * prospect flag is a normal-game deity feature and is ignored in the editor. */
+	if (_game_mode == GM_EDITOR) {
+		const TileIndex t{static_cast<uint32_t>(tile)};
+		if (!IsValidTile(t)) {
+			return dump({{"ok", false}, {"error", "invalid tile"}, {"cost", 0}});
+		}
+		const IndustrySpec *indsp = GetIndustrySpec(it);
+		const uint32_t layout = (indsp != nullptr && !indsp->layouts.empty())
+				? (_interactive_random.Next() % static_cast<uint32_t>(indsp->layouts.size()))
+				: 0;
+		AutoRestoreBackup backup_company(_current_company, OWNER_NONE);
+		AutoRestoreBackup backup_gw(_generating_world, true);
+		AutoRestoreBackup backup_ir(_ignore_industry_restrictions, true);
+		CommandCost cost = Command<CMD_BUILD_INDUSTRY>::Do(
+				DoCommandFlag::Execute, t, it, layout, false, seed);
+		return dump(SctCostResult(cost));
+	}
 
 	if (prospect != 0) {
 		/* Deity prospecting (industry_cmd.cpp:2089): fund=false as OWNER_DEITY, tile
@@ -3266,6 +3359,155 @@ const char *EMSCRIPTEN_KEEPALIVE sct_newgrf_select(const char *grfid_hex, const 
 		return dump({{"ok", false}, {"error", "not selected"}});
 	}
 	return dump({{"ok", true}, {"error", std::string{}}});
+}
+
+/**
+ * Wave 22 — save the current editor map as a scenario. Sanitizes `name` into a bare
+ * filename (path separators and other unsafe chars collapse to '_'), guarantees a
+ * single ".scn" extension, then writes into the scenario directory via
+ * SaveOrLoad(name, SLO_SAVE, DFT_GAME_FILE, SCENARIO_DIR, false) — the same call the
+ * save GUI ultimately reaches (openttd.cpp SM_SAVE_GAME), with the scenario subdir and
+ * .scn extension the SE save window would supply (fios.cpp FiosMakeSavegameName picks
+ * .scn in GM_EDITOR). Editor-only: a scenario is an editor artefact. Runs unthreaded so
+ * the caller can immediately persist IDBFS afterwards.
+ * @return {ok, error, filename?}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_save_scenario(const char *name)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (_game_mode != GM_EDITOR) {
+		return dump({{"ok", false}, {"error", "not in scenario editor"}});
+	}
+	if (name == nullptr || name[0] == '\0') {
+		return dump({{"ok", false}, {"error", "empty name"}});
+	}
+
+	/* Sanitize into a bare filename: keep alphanumerics, space, dash, underscore and
+	 * dot; collapse anything else (path separators included) to '_'. */
+	std::string clean;
+	for (const char *p = name; *p != '\0'; ++p) {
+		const unsigned char c = static_cast<unsigned char>(*p);
+		if (std::isalnum(c) || c == ' ' || c == '-' || c == '_' || c == '.') {
+			clean.push_back(static_cast<char>(c));
+		} else {
+			clean.push_back('_');
+		}
+	}
+	/* Trim leading/trailing spaces and dots so we never produce "." or a hidden name. */
+	const size_t b = clean.find_first_not_of(" .");
+	const size_t e = clean.find_last_not_of(" .");
+	clean = (b == std::string::npos) ? std::string{} : clean.substr(b, e - b + 1);
+	if (clean.empty()) clean = "scenario";
+
+	/* Ensure exactly one ".scn" extension (case-insensitive). */
+	if (clean.size() < 4 || !StrEqualsIgnoreCase(clean.substr(clean.size() - 4), ".scn")) {
+		clean += ".scn";
+	}
+
+	/* Match the SE save-window pre-save step: refresh engine intro dates for the
+	 * (possibly changed) editor date (fios_gui.cpp:849). */
+	StartupEngines();
+
+	const SaveOrLoadResult res = SaveOrLoad(clean, SLO_SAVE, DFT_GAME_FILE, SCENARIO_DIR, false);
+	if (res != SL_OK) {
+		return dump({{"ok", false}, {"error", GetSaveLoadErrorMessage().GetDecodedString()}});
+	}
+	return dump({{"ok", true}, {"error", std::string{}}, {"filename", clean}});
+}
+
+/**
+ * Wave 22 — expand a town (editor-only), mirroring the SE town-view "Expand" button
+ * which posts CMD_EXPAND_TOWN (town_cmd.h) with both expand modes
+ * (Buildings|Roads). `cells` is the number of growth iterations: cells <= 0 uses the
+ * engine's default one-click grow (grow_amount 0 → a house-count-scaled random burst,
+ * exactly like the GUI button, town_cmd.cpp:3266); cells > 0 runs that many explicit
+ * grow iterations. CMD_EXPAND_TOWN carries CommandFlag::Deity and is allowed in the
+ * editor for any owner; we run it as OWNER_NONE to match the editor's local company.
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_expand_town(int town_id, int cells)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (_game_mode != GM_EDITOR) {
+		return dump({{"ok", false}, {"error", "not in scenario editor"}});
+	}
+
+	const TownID tid{static_cast<uint16_t>(town_id)};
+	if (!Town::IsValidID(tid)) {
+		return dump({{"ok", false}, {"error", "invalid town"}});
+	}
+
+	const uint32_t grow_amount = (cells > 0) ? static_cast<uint32_t>(cells) : 0;
+
+	AutoRestoreBackup backup(_current_company, OWNER_NONE);
+
+	CommandCost cost = Command<CMD_EXPAND_TOWN>::Do(
+			DoCommandFlag::Execute, tid, grow_amount,
+			TownExpandModes{TownExpandMode::Buildings, TownExpandMode::Roads});
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 22 — the catchment area of a station, for a coverage overlay.
+ *
+ * We return the catchment RECTANGLE corners (tile X/Y), NOT an enumeration of every
+ * covered tile. Station::GetCatchmentRect() (station.cpp:366) is the authoritative
+ * bounding box the engine itself computes — the station's spread rect grown by the
+ * catchment radius and clamped to the map — while a full tile list can run to several
+ * hundred indices for a large airport (radius up to MAX_CATCHMENT). The rect is compact
+ * and is exactly what a box overlay needs; the four corners are also emitted as tile
+ * indices (NW, NE, SW, SE) for convenience.
+ *
+ * @return JSON {radius, x0, y0, x1, y1, tiles:[nw,ne,sw,se]} in tile coordinates, or
+ *         the literal "null" for an invalid station or one with no tiles yet.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_station_catchment(int station_id)
+{
+	static std::string buffer;
+
+	if (!SctInGame() || !Map::IsInitialized()) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	const Station *st = Station::GetIfValid(station_id);
+	if (st == nullptr || st->rect.IsEmpty()) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	const Rect r = st->GetCatchmentRect();
+	const uint x0 = static_cast<uint>(r.left);
+	const uint y0 = static_cast<uint>(r.top);
+	const uint x1 = static_cast<uint>(r.right);
+	const uint y1 = static_cast<uint>(r.bottom);
+
+	nlohmann::json tiles = nlohmann::json::array();
+	tiles.push_back(TileXY(x0, y0).base()); /* NW */
+	tiles.push_back(TileXY(x1, y0).base()); /* NE */
+	tiles.push_back(TileXY(x0, y1).base()); /* SW */
+	tiles.push_back(TileXY(x1, y1).base()); /* SE */
+
+	nlohmann::json j = {
+		{"radius", st->GetCatchmentRadius()},
+		{"x0", x0}, {"y0", y0},
+		{"x1", x1}, {"y1", y1},
+		{"tiles", std::move(tiles)},
+	};
+	buffer = j.dump();
+	return buffer.c_str();
 }
 
 } /* extern "C" */
