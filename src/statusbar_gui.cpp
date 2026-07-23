@@ -239,5 +239,10 @@ bool IsNewsTickerShown()
  */
 void ShowStatusBar()
 {
+#ifdef __EMSCRIPTEN__
+	extern bool _sct_native_chrome_enabled;
+	if (!_sct_native_chrome_enabled) return;
+#endif
+
 	new StatusBarWindow(_main_status_desc);
 }

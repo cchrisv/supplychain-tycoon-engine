@@ -26,11 +26,13 @@ Module.sct = (function() {
     var _exec = null;
     var _getState = null;
     var _setFastForward = null;
+    var _setNativeToolbar = null;
     var _returnToMenu = null;
     var _query = null;
     var _tileAt = null;
     var _tilePoly = null;
     var _build = null;
+    var _previewBuild = null;
     var _buildVehicle = null;
     var _vehicleCmd = null;
     var _setBuildParam = null;
@@ -79,6 +81,22 @@ Module.sct = (function() {
     var _stationCatchment = null;
     var _setLabels = null;
     var _labels = null;
+    var _moveRailVehicle = null;
+    var _consist = null;
+    var _depotVehicles = null;
+    var _buildSignalTrack = null;
+    var _moveOrder = null;
+    var _addConditionalOrder = null;
+    var _cloneOrders = null;
+    var _sharedVehicles = null;
+    var _bridgeTypes = null;
+    var _startAi = null;
+    var _setGameScript = null;
+    var _newgrfParams = null;
+    var _setNewgrfParam = null;
+    var _startHeightmap = null;
+    var _chat = null;
+    var _rcon = null;
     return {
         exec: function(cmd) {
             if (!_exec) _exec = Module.cwrap('sct_console_exec', null, ['string']);
@@ -91,6 +109,10 @@ Module.sct = (function() {
         setFastForward: function(on) {
             if (!_setFastForward) _setFastForward = Module.cwrap('sct_set_fast_forward', null, ['number']);
             return _setFastForward(on ? 1 : 0);
+        },
+        setNativeToolbar: function(on) {
+            if (!_setNativeToolbar) _setNativeToolbar = Module.cwrap('sct_set_native_toolbar', null, ['number']);
+            return _setNativeToolbar(on ? 1 : 0);
         },
         returnToMenu: function() {
             if (!_returnToMenu) _returnToMenu = Module.cwrap('sct_return_to_menu', null, []);
@@ -121,6 +143,10 @@ Module.sct = (function() {
         build: function(action, a, b, p1, p2) {
             if (!_build) _build = Module.cwrap('sct_build', 'string', ['string', 'number', 'number', 'number', 'number']);
             return JSON.parse(_build(action, a|0, b|0, p1|0, p2|0));
+        },
+        previewBuild: function(action, a, b, p1, p2) {
+            if (!_previewBuild) _previewBuild = Module.cwrap('sct_preview_build', 'string', ['string', 'number', 'number', 'number', 'number']);
+            return JSON.parse(_previewBuild(action, a|0, b|0, p1|0, p2|0));
         },
         buildVehicle: function(depotTile, engineId) {
             if (!_buildVehicle) _buildVehicle = Module.cwrap('sct_build_vehicle', 'string', ['number', 'number']);
@@ -311,6 +337,75 @@ Module.sct = (function() {
             if (!_stationCatchment) _stationCatchment = Module.cwrap('sct_station_catchment', 'string', ['number']);
             var r = _stationCatchment(stationId|0);
             return r ? JSON.parse(r) : null;
+        },
+        moveRailVehicle: function(srcVeh, destVeh, moveChain) {
+            if (!_moveRailVehicle) _moveRailVehicle = Module.cwrap('sct_move_rail_vehicle', 'string', ['number', 'number', 'number']);
+            return JSON.parse(_moveRailVehicle(srcVeh|0, destVeh === undefined || destVeh === null ? -1 : destVeh|0, moveChain ? 1 : 0));
+        },
+        consist: function(vehId) {
+            if (!_consist) _consist = Module.cwrap('sct_consist', 'string', ['number']);
+            var r = _consist(vehId|0);
+            return r ? JSON.parse(r) : [];
+        },
+        depotVehicles: function(x, y) {
+            if (!_depotVehicles) _depotVehicles = Module.cwrap('sct_depot_vehicles', 'string', ['number', 'number']);
+            var r = _depotVehicles(x|0, y|0);
+            return r ? JSON.parse(r) : null;
+        },
+        buildSignalTrack: function(x1, y1, x2, y2, sigtype, density, remove) {
+            if (!_buildSignalTrack) _buildSignalTrack = Module.cwrap('sct_build_signal_track', 'string', ['number', 'number', 'number', 'number', 'number', 'number', 'number']);
+            return JSON.parse(_buildSignalTrack(x1|0, y1|0, x2|0, y2|0, sigtype|0, density === undefined ? 0 : density|0, remove ? 1 : 0));
+        },
+        moveOrder: function(veh, from, to) {
+            if (!_moveOrder) _moveOrder = Module.cwrap('sct_move_order', 'string', ['number', 'number', 'number']);
+            return JSON.parse(_moveOrder(veh|0, from|0, to|0));
+        },
+        addConditionalOrder: function(veh, skipTo) {
+            if (!_addConditionalOrder) _addConditionalOrder = Module.cwrap('sct_add_conditional_order', 'string', ['number', 'number']);
+            return JSON.parse(_addConditionalOrder(veh|0, skipTo|0));
+        },
+        cloneOrders: function(dstVeh, srcVeh, share) {
+            if (!_cloneOrders) _cloneOrders = Module.cwrap('sct_clone_orders', 'string', ['number', 'number', 'number']);
+            return JSON.parse(_cloneOrders(dstVeh|0, srcVeh|0, share ? 1 : 0));
+        },
+        sharedVehicles: function(vehId) {
+            if (!_sharedVehicles) _sharedVehicles = Module.cwrap('sct_shared_vehicles', 'string', ['number']);
+            var r = _sharedVehicles(vehId|0);
+            return r ? JSON.parse(r) : [];
+        },
+        bridgeTypes: function(x1, y1, x2, y2, transport) {
+            if (!_bridgeTypes) _bridgeTypes = Module.cwrap('sct_bridge_types', 'string', ['number', 'number', 'number', 'number', 'number']);
+            var r = _bridgeTypes(x1|0, y1|0, x2|0, y2|0, transport === undefined ? 0 : transport|0);
+            return r ? JSON.parse(r) : [];
+        },
+        startAi: function(name) {
+            if (!_startAi) _startAi = Module.cwrap('sct_start_ai', 'string', ['string']);
+            return JSON.parse(_startAi(name == null ? '' : String(name)));
+        },
+        setGameScript: function(name) {
+            if (!_setGameScript) _setGameScript = Module.cwrap('sct_set_game_script', 'string', ['string']);
+            return JSON.parse(_setGameScript(name == null ? '' : String(name)));
+        },
+        newgrfParams: function(grfidHex) {
+            if (!_newgrfParams) _newgrfParams = Module.cwrap('sct_newgrf_params', 'string', ['string']);
+            var r = _newgrfParams(String(grfidHex));
+            return r ? JSON.parse(r) : null;
+        },
+        setNewgrfParam: function(grfidHex, index, value) {
+            if (!_setNewgrfParam) _setNewgrfParam = Module.cwrap('sct_newgrf_set_param', 'string', ['string', 'number', 'number']);
+            return JSON.parse(_setNewgrfParam(String(grfidHex), index|0, value|0));
+        },
+        startHeightmap: function(filename) {
+            if (!_startHeightmap) _startHeightmap = Module.cwrap('sct_start_heightmap', 'string', ['string']);
+            return JSON.parse(_startHeightmap(filename == null ? '' : String(filename)));
+        },
+        chat: function(destType, dest, msg) {
+            if (!_chat) _chat = Module.cwrap('sct_chat', 'string', ['number', 'number', 'string']);
+            return JSON.parse(_chat(destType|0, dest === undefined || dest === null ? 0 : dest|0, msg == null ? '' : String(msg)));
+        },
+        rcon: function(password, cmd) {
+            if (!_rcon) _rcon = Module.cwrap('sct_rcon', 'string', ['string', 'string']);
+            return JSON.parse(_rcon(password == null ? '' : String(password), cmd == null ? '' : String(cmd)));
         },
     };
 })();

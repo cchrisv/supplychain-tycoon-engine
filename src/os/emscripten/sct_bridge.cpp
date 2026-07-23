@@ -38,6 +38,7 @@
 #include "../../road_cmd.h"
 #include "../../station_cmd.h"
 #include "../../vehicle_cmd.h"
+#include "../../train_cmd.h"
 #include "../../order_cmd.h"
 #include "../../order_type.h"
 #include "../../order_base.h"
@@ -73,10 +74,19 @@
 #include "../../cargotype.h"
 #include "../../network/network_type.h"
 #include "../../network/network_content.h"
+#include "../../network/network.h"
+#include "../../network/network_func.h"
+#include "../../network/network_base.h"
+#include "../../linkgraph/linkgraph.h"
+#include "../../heightmap.h"
+#include "../../fios.h"
 #include "../../genworld.h"
 #include "../../viewport_func.h"
 #include "../../window_func.h"
+#include "../../error.h"
 #include "../../window_gui.h"
+#include "../../toolbar_gui.h"
+#include "../../statusbar_gui.h"
 #include "../../tile_map.h"
 #include "../../rail_map.h"
 #include "../../road_map.h"
@@ -104,6 +114,19 @@
 #include "../../fileio_type.h"
 #include "../../fileio_func.h"
 #include "../../town_type.h"
+#include "../../train.h"
+#include "../../water_cmd.h"
+#include "../../company_cmd.h"
+#include "../../company_type.h"
+#include "../../vehiclelist.h"
+#include "../../subsidy_base.h"
+#include "../../source_type.h"
+#include "../../ai/ai.hpp"
+#include "../../ai/ai_config.hpp"
+#include "../../game/game.hpp"
+#include "../../game/game_config.hpp"
+#include "../../script/script_info.hpp"
+#include "../../script/script_scanner.hpp"
 #include "../../3rdparty/nlohmann/json.hpp"
 
 #include "table/strings.h"
@@ -122,6 +145,7 @@
  * (viewport.cpp); toggleable at runtime through sct_set_native_click below
  * for debugging against stock behaviour. */
 bool _sct_native_viewport_windows = false;
+bool _sct_native_chrome_enabled = false;
 
 /* Defined in engine.cpp; refreshes engine availability caches after a date jump.
  * Declared extern here exactly as cheat_gui.cpp does (no public header). */
@@ -132,6 +156,12 @@ extern void CalendarEnginesMonthlyLoop();
  * here exactly as industry_cmd.cpp does (no public header). Wave 22 uses it to mirror
  * the SE "build industry" tool. */
 extern bool _ignore_industry_restrictions;
+
+/* Defined in openttd.cpp; copies _settings_newgame → _settings_game so a subsequent
+ * new-game / heightmap generation reads the freshly chosen map size. No public header,
+ * so declared extern here exactly as misc.cpp / genworld_gui.cpp do. Wave 29 uses it
+ * from sct_start_heightmap to mirror genworld_gui.cpp's StartGeneratingLandscape. */
+extern void MakeNewgameSettingsLive();
 
 extern "C" {
 
@@ -216,6 +246,22 @@ const char *EMSCRIPTEN_KEEPALIVE sct_get_state()
 void EMSCRIPTEN_KEEPALIVE sct_set_fast_forward(int enabled)
 {
 	ChangeGameSpeed(enabled != 0);
+}
+
+/**
+ * Let the React HUD replace the stock main toolbar without changing the
+ * viewport canvas geometry. Re-enabling restores the native toolbar.
+ */
+void EMSCRIPTEN_KEEPALIVE sct_set_native_toolbar(int enabled)
+{
+	_sct_native_chrome_enabled = enabled != 0;
+	if (enabled != 0) {
+		if (FindWindowById(WC_MAIN_TOOLBAR, 0) == nullptr) AllocateToolbar();
+		if (_game_mode == GM_NORMAL && FindWindowById(WC_STATUS_BAR, 0) == nullptr) ShowStatusBar();
+	} else {
+		CloseWindowById(WC_MAIN_TOOLBAR, 0);
+		CloseWindowById(WC_STATUS_BAR, 0);
+	}
 }
 
 /**
@@ -405,6 +451,14 @@ static nlohmann::json SctQueryEngines()
 			name = GetString(STR_ENGINE_NAME, e->index);
 		}
 
+		/* Wave 26 — consist-editor fields. `wagon` marks a non-motorised rail wagon
+		 * (RailVehInfo(e)->railveh_type == RAILVEH_WAGON), always false for non-train
+		 * engines. `capacity` is the engine's default-cargo display capacity;
+		 * `cargo` its default CargoType (-1 when it carries nothing). */
+		const bool wagon = (e->type == VEH_TRAIN) &&
+				RailVehInfo(e->index)->railveh_type == RAILVEH_WAGON;
+		const CargoType default_cargo = e->GetDefaultCargoType();
+
 		arr.push_back({
 			{"id", e->index.base()},
 			{"name", name},
@@ -412,6 +466,9 @@ static nlohmann::json SctQueryEngines()
 			{"introYear", ymd.year.base()},
 			{"reliability", static_cast<int>(ToPercent16(e->reliability))},
 			{"cost", static_cast<int64_t>(e->GetCost())},
+			{"wagon", wagon},
+			{"capacity", static_cast<int>(e->GetDisplayDefaultCapacity())},
+			{"cargo", IsValidCargoType(default_cargo) ? static_cast<int>(default_cargo) : -1},
 		});
 	}
 	return arr;
@@ -663,6 +720,75 @@ static RoadType SctResolveRoadType(int p1)
 	return ROADTYPE_ROAD;
 }
 
+/**
+ * Shared autorail drag resolution for preview, build, and removal.
+ *
+ * This is the tile-centre equivalent of viewport.cpp CalcRaildirsDrawstyle:
+ * measure each delta as a span including one tile, keep shallow gestures on a
+ * map axis, then trim a mixed gesture onto the nearest half-track line.
+ * The React guide mirrors this calculation, so guide and command agree.
+ */
+struct SctRailDrag {
+	TileIndex end;
+	Track track;
+	Track alternate;
+};
+
+static SctRailDrag SctResolveRailDrag(TileIndex start, TileIndex requested_end, int explicit_track)
+{
+	if (explicit_track >= TRACK_BEGIN && explicit_track < TRACK_END) {
+		return {requested_end, static_cast<Track>(explicit_track), INVALID_TRACK};
+	}
+
+	const int ax = static_cast<int>(TileX(start));
+	const int ay = static_cast<int>(TileY(start));
+	const int bx = static_cast<int>(TileX(requested_end));
+	const int by = static_cast<int>(TileY(requested_end));
+	const int dx = bx - ax;
+	const int dy = by - ay;
+	const int adx = std::abs(dx);
+	const int ady = std::abs(dy);
+	const int max_x = static_cast<int>(Map::MaxX());
+	const int max_y = static_cast<int>(Map::MaxY());
+
+	if (dy == 0 || adx + 1 > 2 * (ady + 1)) {
+		return {
+			TileXY(static_cast<uint>(std::clamp(bx, 0, max_x)), static_cast<uint>(std::clamp(ay, 0, max_y))),
+			TRACK_X,
+			INVALID_TRACK,
+		};
+	}
+	if (dx == 0 || ady + 1 > 2 * (adx + 1)) {
+		return {
+			TileXY(static_cast<uint>(std::clamp(ax, 0, max_x)), static_cast<uint>(std::clamp(by, 0, max_y))),
+			TRACK_Y,
+			INVALID_TRACK,
+		};
+	}
+
+	const int sx = dx >= 0 ? 1 : -1;
+	const int sy = dy >= 0 ? 1 : -1;
+	const int end_x = adx > ady ? ax + (ady + 1) * sx : bx;
+	const int end_y = ady > adx ? ay + (adx + 1) * sy : by;
+	const TileIndex end = TileXY(
+			static_cast<uint>(std::clamp(end_x, 0, max_x)),
+			static_cast<uint>(std::clamp(end_y, 0, max_y)));
+
+	/* Balanced drags use sub-tile cursor position natively. The web gesture
+	 * starts from tile centres, so choose the centre result and retry sibling. */
+	if (adx == ady) {
+		if (sx > 0 && sy > 0) return {end, TRACK_RIGHT, TRACK_LEFT};
+		if (sx > 0 && sy < 0) return {end, TRACK_LOWER, TRACK_UPPER};
+		if (sx < 0 && sy > 0) return {end, TRACK_LOWER, TRACK_UPPER};
+		return {end, TRACK_RIGHT, TRACK_LEFT};
+	}
+
+	if (sx > 0 && sy > 0) return {end, adx > ady ? TRACK_LEFT : TRACK_RIGHT, INVALID_TRACK};
+	if (sx > 0 && sy < 0) return {end, adx > ady ? TRACK_LOWER : TRACK_UPPER, INVALID_TRACK};
+	if (sx < 0 && sy > 0) return {end, adx > ady ? TRACK_UPPER : TRACK_LOWER, INVALID_TRACK};
+	return {end, adx > ady ? TRACK_RIGHT : TRACK_LEFT, INVALID_TRACK};
+}
+
 static DiagDirection SctResolveDiagDir(int p2)
 {
 	if (p2 >= DIAGDIR_BEGIN && p2 < DIAGDIR_END) return static_cast<DiagDirection>(p2);
@@ -890,6 +1016,212 @@ static nlohmann::json SctQueryNewgrfAvailable()
 	return arr;
 }
 
+/**
+ * Wave 26 — resolve a subsidy Source (industry / town) to a display name. Company
+ * headquarters sources never appear in the subsidy list, so they are labelled
+ * generically. Mirrors subsidy.cpp Source::GetFormat (Industry/Town names).
+ */
+static std::string SctSourceName(const Source &src)
+{
+	switch (src.type) {
+		case SourceType::Industry: {
+			const Industry *i = Industry::GetIfValid(src.ToIndustryID());
+			return (i != nullptr) ? i->GetCachedName() : std::string{};
+		}
+		case SourceType::Town: {
+			const Town *t = Town::GetIfValid(src.ToTownID());
+			return (t != nullptr) ? t->GetCachedName() : std::string{};
+		}
+		default:
+			return {};
+	}
+}
+
+/**
+ * Wave 26 — offered / awarded subsidies (subsidy_base.h Subsidy pool). srcType /
+ * dstType map SourceType (0 industry, 1 town, 2 headquarters); awardedTo is the
+ * company index the subsidy is awarded to, or -1 when still merely offered.
+ * monthsLeft is the `remaining` month counter (offer window while unawarded, the
+ * subsidised duration once awarded).
+ */
+static nlohmann::json SctQuerySubsidies()
+{
+	nlohmann::json arr = nlohmann::json::array();
+	if (!SctInGame()) return arr;
+
+	for (const Subsidy *s : Subsidy::Iterate()) {
+		arr.push_back({
+			{"id", s->index.base()},
+			{"cargo", IsValidCargoType(s->cargo_type) ? static_cast<int>(s->cargo_type) : -1},
+			{"srcType", static_cast<int>(s->src.type)},
+			{"srcId", static_cast<int>(s->src.id)},
+			{"srcName", SctSourceName(s->src)},
+			{"dstType", static_cast<int>(s->dst.type)},
+			{"dstId", static_cast<int>(s->dst.id)},
+			{"dstName", SctSourceName(s->dst)},
+			{"awardedTo", s->IsAwarded() ? static_cast<int>(s->awarded.base()) : -1},
+			{"monthsLeft", s->remaining},
+		});
+	}
+	return arr;
+}
+
+/**
+ * Wave 26 — cargo payment-rate curves for the payments graph. Replicates the exact
+ * call graph_gui.cpp PaymentRatesGraphWindow::UpdatePaymentRates makes:
+ * GetTransportedGoodsIncome(10, 20, j*4+4, cargo) for j in 0..GRAPH_PAYMENT_RATE_STEPS-1
+ * (20 steps). `days` is the transit-periods x value (j*4+4); `income` the money for
+ * that leg. `color` is the cargo's legend palette index (cargotype.h legend_colour).
+ */
+static nlohmann::json SctQueryCargoPaymentRates()
+{
+	nlohmann::json arr = nlohmann::json::array();
+	if (!SctInGame()) return arr;
+
+	static const int GRAPH_PAYMENT_RATE_STEPS = 20;
+
+	for (const CargoSpec *cs : CargoSpec::Iterate()) {
+		if (!cs->IsValid()) continue;
+
+		nlohmann::json points = nlohmann::json::array();
+		for (int j = 0; j < GRAPH_PAYMENT_RATE_STEPS; j++) {
+			const uint16_t periods = static_cast<uint16_t>(j * 4 + 4);
+			points.push_back({
+				{"days", static_cast<int>(periods)},
+				{"income", static_cast<int64_t>(GetTransportedGoodsIncome(10, 20, periods, cs->Index()))},
+			});
+		}
+
+		arr.push_back({
+			{"cargo", static_cast<int>(cs->Index())},
+			{"label", GetString(cs->name)},
+			{"color", static_cast<int>(cs->legend_colour.p)},
+			{"points", std::move(points)},
+		});
+	}
+	return arr;
+}
+
+/** Wave 26 — flatten a ScriptInfoList (AI / Game) to [{name, version}] rows. */
+static nlohmann::json SctScriptInfoList(const ScriptInfoList *list)
+{
+	nlohmann::json arr = nlohmann::json::array();
+	if (list == nullptr) return arr;
+
+	for (const auto &item : *list) {
+		const ScriptInfo *info = item.second;
+		if (info == nullptr) continue;
+		arr.push_back({
+			{"name", info->GetName()},
+			{"version", info->GetVersion()},
+		});
+	}
+	return arr;
+}
+
+/** Wave 26 — installed AIs (best version per unique AI), mirroring `list_ai`. */
+static nlohmann::json SctQueryAiList()
+{
+	return SctScriptInfoList(AI::GetUniqueInfoList());
+}
+
+/** Wave 26 — installed Game Scripts (best version per unique GS), like `list_game`. */
+static nlohmann::json SctQueryGsList()
+{
+	return SctScriptInfoList(Game::GetUniqueInfoList());
+}
+
+/**
+ * Wave 29 — resolve the canonical 8-hex-char display grfid (the form
+ * query('newgrfAvailable') emits, std::byteswap of the stored little-endian grfid) to
+ * its entry in the new-game config (_grfconfig_newgame). Parses the id exactly the way
+ * sct_newgrf_select does. Returns nullptr when the GRF is not currently selected.
+ */
+static GRFConfig *SctFindNewgameGrf(const char *grfid_hex)
+{
+	if (grfid_hex == nullptr || grfid_hex[0] == '\0') return nullptr;
+	const uint32_t display_grfid = static_cast<uint32_t>(std::strtoul(grfid_hex, nullptr, 16));
+	const uint32_t grfid = std::byteswap(display_grfid);
+	for (const auto &c : _grfconfig_newgame) {
+		if (c->ident.grfid == grfid) return c.get();
+	}
+	return nullptr;
+}
+
+/**
+ * Wave 29 — connected clients in a network game (network_base.h NetworkClientInfo pool).
+ * `company` is the company the client plays as, or -1 for spectators (COMPANY_SPECTATOR).
+ * Empty array when not networking.
+ */
+static nlohmann::json SctQueryNetworkClients()
+{
+	nlohmann::json arr = nlohmann::json::array();
+	if (!_networking) return arr;
+
+	for (const NetworkClientInfo *ci : NetworkClientInfo::Iterate()) {
+		const bool spectator = (ci->client_playas == COMPANY_SPECTATOR);
+		arr.push_back({
+			{"id", static_cast<int>(ci->client_id)},
+			{"name", ci->client_name},
+			{"company", spectator ? -1 : static_cast<int>(ci->client_playas.base())},
+		});
+	}
+	return arr;
+}
+
+/**
+ * Wave 29 — per-cargo link-graph edges for cargo-distribution overlays. Iterates every
+ * LinkGraph (linkgraph.h LinkGraph::Iterate()); for each graph its cargo, for each node
+ * its outgoing edges. from/to are station ids; fromTile/toTile are the stations' tiles
+ * (Station::GetIfValid → xy, falling back to the node's cached xy). capacity/usage come
+ * straight off the edge; "planned" flows live in per-station FlowStats (not cheaply
+ * available here), so planned = usage as documented. Self-edges and invalid destinations
+ * are skipped. Total edges are capped at 600 (simple iteration order, not sorted).
+ */
+static nlohmann::json SctQueryLinkFlows()
+{
+	nlohmann::json arr = nlohmann::json::array();
+	if (!SctInGame()) return arr;
+
+	constexpr int MAX_EDGES = 600; // cap total emitted edges; simple (unsorted) order
+	int emitted = 0;
+
+	for (const LinkGraph *lg : LinkGraph::Iterate()) {
+		const CargoType cargo = lg->Cargo();
+		const int cargo_json = IsValidCargoType(cargo) ? static_cast<int>(cargo) : -1;
+
+		for (NodeID from = 0; from < lg->Size(); from++) {
+			const LinkGraph::BaseNode &fnode = (*lg)[from];
+			const Station *fst = Station::GetIfValid(fnode.station);
+			const TileIndex ftile = (fst != nullptr) ? fst->xy : fnode.xy;
+
+			for (const LinkGraph::BaseEdge &edge : fnode.edges) {
+				if (emitted >= MAX_EDGES) return arr;
+
+				const NodeID to = edge.dest_node;
+				if (to == INVALID_NODE || to == from || to >= lg->Size()) continue;
+
+				const LinkGraph::BaseNode &tnode = (*lg)[to];
+				const Station *tst = Station::GetIfValid(tnode.station);
+				const TileIndex ttile = (tst != nullptr) ? tst->xy : tnode.xy;
+
+				arr.push_back({
+					{"cargo", cargo_json},
+					{"from", static_cast<int>(fnode.station.base())},
+					{"to", static_cast<int>(tnode.station.base())},
+					{"fromTile", ftile.base()},
+					{"toTile", ttile.base()},
+					{"capacity", static_cast<int64_t>(edge.capacity)},
+					{"usage", static_cast<int64_t>(edge.usage)},
+					{"planned", static_cast<int64_t>(edge.usage)},
+				});
+				emitted++;
+			}
+		}
+	}
+	return arr;
+}
+
 } // namespace
 
 /**
@@ -938,6 +1270,18 @@ const char *EMSCRIPTEN_KEEPALIVE sct_query(const char *kind)
 		j = SctQueryCompanies();
 	} else if (std::strcmp(kind, "newgrfAvailable") == 0) {
 		j = SctQueryNewgrfAvailable();
+	} else if (std::strcmp(kind, "subsidies") == 0) {
+		j = SctQuerySubsidies();
+	} else if (std::strcmp(kind, "cargo_payment_rates") == 0) {
+		j = SctQueryCargoPaymentRates();
+	} else if (std::strcmp(kind, "ai_list") == 0) {
+		j = SctQueryAiList();
+	} else if (std::strcmp(kind, "gs_list") == 0) {
+		j = SctQueryGsList();
+	} else if (std::strcmp(kind, "network_clients") == 0) {
+		j = SctQueryNetworkClients();
+	} else if (std::strcmp(kind, "link_flows") == 0) {
+		j = SctQueryLinkFlows();
 	} else {
 		j = {{"error", "unknown kind"}};
 	}
@@ -1228,104 +1572,36 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 	const TileIndex tile_b{static_cast<uint32_t>(b)};
 
 	if (std::strcmp(action, "rail_track") == 0) {
-		/* Wave 7 — robust track drag: snap to dominant axis, auto-flatten the
-		 * line, then build. rail_cmd.h:19 CmdBuildRailroadTrack(end, start,
-		 * railtype, track, auto_remove_signals, fail_on_obstacle).
-		 * p2==0 (or out of range) = auto snap; non-zero valid Track overrides
-		 * and keeps end = b (contract: track dir 0 auto). */
+		/* Autorail build. Terrain stays authoritative: unlike the old bridge,
+		 * this never silently levels land before construction. The preview
+		 * therefore reports the same slope/obstacle result the commit will use. */
 		const RailType rt = SctResolveRailType(p1);
-
-		TileIndex snapped_end = tile_b;
-		Track track = TRACK_X;
-		Track track_alt = INVALID_TRACK; /* sibling half-track to retry with */
-		bool diagonal = false;
-
-		if (p2 != 0 && p2 >= TRACK_BEGIN && p2 < TRACK_END) {
-			/* Explicit track override — keep dragged end tile as-is. */
-			track = static_cast<Track>(p2);
-			snapped_end = tile_b;
-		} else {
-			/* Wave 12 — snap to the nearest of the EIGHT drag directions:
-			 * tile-axis runs (TRACK_X / TRACK_Y, the screen diagonals) or 45°
-			 * staircase runs built from half-tile tracks (TRACK_UPPER/LOWER for
-			 * screen-horizontal, TRACK_LEFT/RIGHT for screen-vertical drags).
-			 * CmdBuildRailroadTrack alternates the half tracks itself
-			 * (ValidateAutoDrag + the trackdir toggle in its build loop). The
-			 * React BuildCaptureLayer mirrors this exact rule for its preview:
-			 * axis wins when 2*max(|dx|,|dy|) >= 5*min (i.e. within ~22.5° of
-			 * the axis), else staircase of length round((|dx|+|dy|)/2). */
-			const int ax = static_cast<int>(TileX(tile_a));
-			const int ay = static_cast<int>(TileY(tile_a));
-			const int bx = static_cast<int>(TileX(tile_b));
-			const int by = static_cast<int>(TileY(tile_b));
-			const int dx = bx - ax;
-			const int dy = by - ay;
-			const int adx = std::abs(dx);
-			const int ady = std::abs(dy);
-			const int max_x = static_cast<int>(Map::MaxX());
-			const int max_y = static_cast<int>(Map::MaxY());
-
-			if (2 * std::max(adx, ady) >= 5 * std::min(adx, ady)) {
-				/* Axis-aligned run (track_type.h:21-22). */
-				if (adx >= ady) {
-					track = TRACK_X;
-					snapped_end = TileXY(static_cast<uint>(std::clamp(bx, 0, max_x)),
-							static_cast<uint>(std::clamp(ay, 0, max_y)));
-				} else {
-					track = TRACK_Y;
-					snapped_end = TileXY(static_cast<uint>(std::clamp(ax, 0, max_x)),
-							static_cast<uint>(std::clamp(by, 0, max_y)));
-				}
-			} else {
-				/* 45° staircase. Which half (upper/lower, left/right) the run
-				 * starts with depends on sub-tile grab position we don't have,
-				 * so try one and fall back to its sibling. */
-				diagonal = true;
-				const int sx = dx >= 0 ? 1 : -1;
-				const int sy = dy >= 0 ? 1 : -1;
-				const int n = (adx + ady + 1) / 2;
-				const int end_x = std::clamp(ax + n * sx, 0, max_x);
-				const int end_y = std::clamp(ay + n * sy, 0, max_y);
-				snapped_end = TileXY(static_cast<uint>(end_x), static_cast<uint>(end_y));
-				if (sx == sy) {
-					/* Screen-vertical (x and y move together). */
-					track = TRACK_LEFT;
-					track_alt = TRACK_RIGHT;
-				} else {
-					/* Screen-horizontal (x and y move opposite). */
-					track = TRACK_UPPER;
-					track_alt = TRACK_LOWER;
-				}
-			}
-		}
+		const SctRailDrag drag = SctResolveRailDrag(tile_a, tile_b, p2);
 
 		/* Off-map guard: start/end must be on the map (tile_map.h IsValidTile). */
-		if (!IsValidTile(tile_a) || !IsValidTile(snapped_end)) {
+		if (!IsValidTile(tile_a) || !IsValidTile(drag.end)) {
 			return dump({{"ok", false}, {"error", "invalid tile"}, {"cost", 0}});
 		}
 
-		/* Auto-flatten axis runs first (terraform_cmd.h:18 CmdLevelLand — the
-		 * rect between the endpoints IS the line there). For staircase runs the
-		 * rect would be n×n tiles, so try the build on natural terrain first
-		 * and only level-then-retry when it fails. */
-		if (!diagonal) {
-			(void)Command<CMD_LEVEL_LAND>::Do(DoCommandFlag::Execute, snapped_end, tile_a, false, LM_LEVEL);
-		}
-
 		CommandCost cost = Command<CMD_BUILD_RAILROAD_TRACK>::Do(
-				DoCommandFlag::Execute, snapped_end, tile_a, rt, track, true, false);
-		if (cost.Failed() && track_alt != INVALID_TRACK) {
+				DoCommandFlag::Execute, drag.end, tile_a, rt, drag.track, true, false);
+		if (cost.Failed() && drag.alternate != INVALID_TRACK) {
 			cost = Command<CMD_BUILD_RAILROAD_TRACK>::Do(
-					DoCommandFlag::Execute, snapped_end, tile_a, rt, track_alt, true, false);
+					DoCommandFlag::Execute, drag.end, tile_a, rt, drag.alternate, true, false);
 		}
-		if (cost.Failed() && diagonal) {
-			(void)Command<CMD_LEVEL_LAND>::Do(DoCommandFlag::Execute, snapped_end, tile_a, false, LM_LEVEL);
-			cost = Command<CMD_BUILD_RAILROAD_TRACK>::Do(
-					DoCommandFlag::Execute, snapped_end, tile_a, rt, track, true, false);
-			if (cost.Failed() && track_alt != INVALID_TRACK) {
-				cost = Command<CMD_BUILD_RAILROAD_TRACK>::Do(
-						DoCommandFlag::Execute, snapped_end, tile_a, rt, track_alt, true, false);
-			}
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "remove_rail") == 0) {
+		const SctRailDrag drag = SctResolveRailDrag(tile_a, tile_b, p2);
+		if (!IsValidTile(tile_a) || !IsValidTile(drag.end)) {
+			return dump({{"ok", false}, {"error", "invalid tile"}, {"cost", 0}});
+		}
+		CommandCost cost = Command<CMD_REMOVE_RAILROAD_TRACK>::Do(
+				DoCommandFlag::Execute, drag.end, tile_a, drag.track);
+		if (cost.Failed() && drag.alternate != INVALID_TRACK) {
+			cost = Command<CMD_REMOVE_RAILROAD_TRACK>::Do(
+					DoCommandFlag::Execute, drag.end, tile_a, drag.alternate);
 		}
 		return dump(SctCostResult(cost));
 	}
@@ -1412,6 +1688,20 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 		return dump(SctCostResult(cost));
 	}
 
+	if (std::strcmp(action, "remove_road") == 0) {
+		const RoadType rt = SctResolveRoadType(p1);
+		if (!IsValidTile(tile_a) || !IsValidTile(tile_b)) {
+			return dump({{"ok", false}, {"error", "invalid tile"}, {"cost", 0}});
+		}
+		if (TileX(tile_a) != TileX(tile_b) && TileY(tile_a) != TileY(tile_b)) {
+			return dump({{"ok", false}, {"error", "road not axis-aligned"}, {"cost", 0}});
+		}
+		const Axis axis = (TileY(tile_a) != TileY(tile_b)) ? AXIS_Y : AXIS_X;
+		auto result = Command<CMD_REMOVE_LONG_ROAD>::Do(
+				DoCommandFlag::Execute, tile_b, tile_a, rt, axis, false, false);
+		return dump(SctCostResult(std::get<0>(result)));
+	}
+
 	if (std::strcmp(action, "one_way_road") == 0) {
 		/* Wave 21 — build road then flag one-way, mirroring the "road" action with a
 		 * disallowed-direction set. p1 = roadtype (as "road"); p2 selects the
@@ -1459,6 +1749,73 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 		/* station_cmd.h:27 CmdBuildDock */
 		CommandCost cost = Command<CMD_BUILD_DOCK>::Do(
 				DoCommandFlag::Execute, tile_a, StationID::Invalid(), false);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "canal") == 0) {
+		/* Wave 26 — water_cmd.h CmdBuildCanal(end_tile, start_tile, WaterClass, diagonal).
+		 * a=end, b=start of the drag rectangle (dock_gui.cpp:267-273 passes end,start).
+		 * Canals for a normal game; in the scenario editor with p1==1 place rivers
+		 * (WaterClass::River), matching the SE "define rivers" tool. diagonal=false. */
+		if (!IsValidTile(tile_a) || !IsValidTile(tile_b)) {
+			return dump({{"ok", false}, {"error", "invalid tile"}, {"cost", 0}});
+		}
+		const WaterClass wc = (_game_mode == GM_EDITOR && p1 == 1)
+				? WaterClass::River
+				: WaterClass::Canal;
+		CommandCost cost = Command<CMD_BUILD_CANAL>::Do(
+				DoCommandFlag::Execute, tile_a, tile_b, wc, false);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "lock") == 0) {
+		/* Wave 26 — water_cmd.h CmdBuildLock(tile) (dock_gui.cpp:203). */
+		CommandCost cost = Command<CMD_BUILD_LOCK>::Do(DoCommandFlag::Execute, tile_a);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "buoy") == 0) {
+		/* Wave 26 — waypoint_cmd.h CmdBuildBuoy(tile) (dock_gui.cpp:233). */
+		CommandCost cost = Command<CMD_BUILD_BUOY>::Do(DoCommandFlag::Execute, tile_a);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "ship_depot") == 0) {
+		/* Wave 26 — water_cmd.h CmdBuildShipDepot(tile, Axis) (dock_gui.cpp:211);
+		 * p1 selects the axis (0 X, 1 Y). */
+		const Axis axis = SctResolveAxis(p1);
+		CommandCost cost = Command<CMD_BUILD_SHIP_DEPOT>::Do(
+				DoCommandFlag::Execute, tile_a, axis);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "aqueduct") == 0) {
+		/* Wave 26 — an aqueduct is a TRANSPORT_WATER bridge; dock_gui.cpp:241 builds it
+		 * with bridge_type 0 and road_rail_type 0. Mirrors the "bridge" action plumbing
+		 * (a=end ramp, b=start ramp), auto-picking the cheapest valid water bridge spec
+		 * for the span so it is robust to NewGRF aqueduct sets. */
+		if (!IsValidTile(tile_a) || !IsValidTile(tile_b)) {
+			return dump({{"ok", false}, {"error", "invalid tile"}, {"cost", 0}});
+		}
+		const uint bridge_len = GetTunnelBridgeLength(tile_b, tile_a);
+		BridgeType bt = 0;
+		bool found = false;
+		uint16_t best_price = 0;
+		for (BridgeType cand = 0; cand < MAX_BRIDGES; cand++) {
+			if (CheckBridgeAvailability(cand, bridge_len).Failed()) continue;
+			const uint16_t price = GetBridgeSpec(cand)->price;
+			if (!found || price < best_price) {
+				best_price = price;
+				bt = cand;
+				found = true;
+			}
+		}
+		if (!found) {
+			return dump({{"ok", false}, {"error", "no bridge available"}, {"cost", 0}});
+		}
+		CommandCost cost = Command<CMD_BUILD_BRIDGE>::Do(
+				DoCommandFlag::Execute, tile_a, tile_b, TRANSPORT_WATER,
+				bt, static_cast<uint8_t>(0));
 		return dump(SctCostResult(cost));
 	}
 
@@ -1592,6 +1949,78 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 	}
 
 	return dump({{"ok", false}, {"error", "unknown action"}, {"cost", 0}});
+}
+
+/**
+ * Test a rail/road construction gesture without mutating the simulation.
+ *
+ * The React construction guide calls this after snapping the pointer. Keeping
+ * validation in OpenTTD means the guide reports real ownership, slope, vehicle,
+ * obstacle, and local-authority failures instead of a client-side guess.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_preview_build(const char *action, int a, int b, int p1, int p2)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (action == nullptr || !SctCanBuild()) {
+		return dump({{"ok", false}, {"error", action == nullptr ? "unknown action" : "not in game"}, {"cost", 0}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+	const TileIndex tile_a{static_cast<uint32_t>(a)};
+	const TileIndex tile_b{static_cast<uint32_t>(b)};
+	if (!IsValidTile(tile_a) || !IsValidTile(tile_b)) {
+		return dump({{"ok", false}, {"error", "invalid tile"}, {"cost", 0}});
+	}
+
+	if (std::strcmp(action, "rail_track") == 0 || std::strcmp(action, "remove_rail") == 0) {
+		const SctRailDrag drag = SctResolveRailDrag(tile_a, tile_b, p2);
+		CommandCost cost = (std::strcmp(action, "remove_rail") == 0)
+				? Command<CMD_REMOVE_RAILROAD_TRACK>::Do(DoCommandFlags{}, drag.end, tile_a, drag.track)
+				: Command<CMD_BUILD_RAILROAD_TRACK>::Do(
+						DoCommandFlags{}, drag.end, tile_a, SctResolveRailType(p1), drag.track, true, false);
+		if (cost.Failed() && drag.alternate != INVALID_TRACK) {
+			cost = (std::strcmp(action, "remove_rail") == 0)
+					? Command<CMD_REMOVE_RAILROAD_TRACK>::Do(DoCommandFlags{}, drag.end, tile_a, drag.alternate)
+					: Command<CMD_BUILD_RAILROAD_TRACK>::Do(
+							DoCommandFlags{}, drag.end, tile_a, SctResolveRailType(p1), drag.alternate, true, false);
+		}
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "road") == 0 || std::strcmp(action, "one_way_road") == 0 ||
+			std::strcmp(action, "remove_road") == 0) {
+		if (TileX(tile_a) != TileX(tile_b) && TileY(tile_a) != TileY(tile_b)) {
+			return dump({{"ok", false}, {"error", "road not axis-aligned"}, {"cost", 0}});
+		}
+
+		const RoadType rt = SctResolveRoadType(p1);
+		const Axis axis = (TileY(tile_a) != TileY(tile_b)) ? AXIS_Y : AXIS_X;
+		if (std::strcmp(action, "remove_road") == 0) {
+			auto result = Command<CMD_REMOVE_LONG_ROAD>::Do(
+					DoCommandFlags{}, tile_b, tile_a, rt, axis, false, false);
+			return dump(SctCostResult(std::get<0>(result)));
+		}
+
+		const DisallowedRoadDirections drd = std::strcmp(action, "one_way_road") == 0
+				? DRD_NORTHBOUND
+				: DRD_NONE;
+		if (tile_a == tile_b) {
+			CommandCost cost = Command<CMD_BUILD_ROAD>::Do(
+					DoCommandFlags{}, tile_a, ROAD_X, rt, drd, TownID::Invalid());
+			return dump(SctCostResult(cost));
+		}
+		CommandCost cost = Command<CMD_BUILD_LONG_ROAD>::Do(
+				DoCommandFlags{}, tile_b, tile_a, rt, axis, drd, false, false, false);
+		return dump(SctCostResult(cost));
+	}
+
+	return dump({{"ok", false}, {"error", "preview unavailable"}, {"cost", 0}});
 }
 
 /**
@@ -3508,6 +3937,664 @@ const char *EMSCRIPTEN_KEEPALIVE sct_station_catchment(int station_id)
 	};
 	buffer = j.dump();
 	return buffer.c_str();
+}
+
+/**
+ * Wave 26 — move a rail vehicle between consists (drag/drop in the depot editor).
+ * train_cmd.h CmdMoveRailVehicle(flags, src_veh, dest_veh, move_chain). moveChain
+ * != 0 moves src and everything behind it. destVeh < 0 → VehicleID::Invalid(),
+ * which detaches src into a new free wagon chain in the same depot.
+ * @return {ok, error, cost}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_move_rail_vehicle(int src_veh, int dest_veh, int move_chain)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}, {"cost", 0}});
+	}
+
+	const VehicleID src{static_cast<uint32_t>(src_veh)};
+	if (!Vehicle::IsValidID(src)) {
+		return dump({{"ok", false}, {"error", "invalid vehicle"}, {"cost", 0}});
+	}
+	const VehicleID dest = (dest_veh < 0)
+			? VehicleID::Invalid()
+			: VehicleID{static_cast<uint32_t>(dest_veh)};
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_MOVE_RAIL_VEHICLE>::Do(
+			DoCommandFlag::Execute, src, dest, move_chain != 0);
+	return dump(SctCostResult(cost));
+}
+
+/**
+ * Wave 26 — a vehicle's consist front→back, one entry per real unit (articulated
+ * parts collapse into their engine via GetNextUnit). For a train, walks from the
+ * front of the chain the given vehicle belongs to; any other vehicle type yields a
+ * single entry. `wagon` is true for a non-motorised rail wagon; `cargo` is the unit's
+ * current CargoType (-1 when none); `capacity` its cargo_cap; `count` is always 1.
+ * @return JSON array, or "[]" for an invalid id.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_consist(int veh_id)
+{
+	static std::string buffer;
+
+	const Vehicle *v = Vehicle::GetIfValid(veh_id);
+	if (v == nullptr) {
+		buffer = "[]";
+		return buffer.c_str();
+	}
+
+	nlohmann::json arr = nlohmann::json::array();
+
+	auto emit = [&](const Vehicle *u, bool wagon) {
+		arr.push_back({
+			{"id", static_cast<int>(u->index.base())},
+			{"engine", static_cast<int>(u->engine_type.base())},
+			{"name", GetString(STR_ENGINE_NAME, u->engine_type)},
+			{"wagon", wagon},
+			{"cargo", IsValidCargoType(u->cargo_type) ? static_cast<int>(u->cargo_type) : -1},
+			{"capacity", static_cast<int>(u->cargo_cap)},
+			{"count", 1},
+		});
+	};
+
+	if (v->type == VEH_TRAIN) {
+		for (const Train *u = Train::From(v)->First(); u != nullptr; u = u->GetNextUnit()) {
+			emit(u, u->IsWagon());
+		}
+	} else {
+		emit(v, false);
+	}
+
+	buffer = arr.dump();
+	return buffer.c_str();
+}
+
+/**
+ * Wave 26 — the trains parked in the rail depot at tile (x, y). vehiclelist.h
+ * BuildDepotVehicleList(VEH_TRAIN, tile, &engines, &wagons) (depot_gui.cpp:737):
+ * `vehicles` are the front-engine consists, `wagons` the free-wagon chains (each id
+ * is the front of its chain).
+ * @return JSON {vehicles:[id...], wagons:[id...]}, or the literal "null" when the
+ *         tile is not a train depot.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_depot_vehicles(int x, int y)
+{
+	static std::string buffer;
+
+	if (!SctInGame() || !Map::IsInitialized()) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+	if (x < 0 || y < 0 || static_cast<uint>(x) > Map::MaxX() || static_cast<uint>(y) > Map::MaxY()) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	const TileIndex tile = TileXY(static_cast<uint>(x), static_cast<uint>(y));
+	if (!IsRailDepotTile(tile)) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	VehicleList engines;
+	VehicleList wagons;
+	BuildDepotVehicleList(VEH_TRAIN, tile, &engines, &wagons);
+
+	nlohmann::json veh = nlohmann::json::array();
+	for (const Vehicle *e : engines) veh.push_back(static_cast<int>(e->index.base()));
+	nlohmann::json wag = nlohmann::json::array();
+	for (const Vehicle *w : wagons) wag.push_back(static_cast<int>(w->index.base()));
+
+	nlohmann::json j = {{"vehicles", std::move(veh)}, {"wagons", std::move(wag)}};
+	buffer = j.dump();
+	return buffer.c_str();
+}
+
+/**
+ * Wave 26 — build (or remove) signals along a straight rail drag from (x1,y1) to
+ * (x2,y2). The drag is guaranteed axis- or diagonal-aligned by the UI; the track is
+ * inferred with the shared rail-line snap helper (SctResolveRailDrag, auto-snap).
+ * rail_cmd.h CmdBuildSignalTrack(flags, tile, end_tile, track, sigtype, sigvar,
+ * mode, autofill, minimise_gaps, density) and CmdRemoveSignalTrack(flags, tile,
+ * end_tile, track, autofill). sigtype is a SignalType int (signal_type.h:
+ * 0=SIGTYPE_BLOCK, 1=ENTRY, 2=EXIT, 3=COMBO, 4=SIGTYPE_PBS, 5=SIGTYPE_PBS_ONEWAY);
+ * out-of-range falls back to SIGTYPE_BLOCK. density is the tiles-between-signals
+ * spacing (clamped 1..20; <=0 → 1). remove != 0 removes instead of building.
+ * @return {ok, error, cost}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_build_signal_track(int x1, int y1, int x2, int y2, int sigtype, int density, int remove)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}, {"cost", 0}});
+	}
+	if (x1 < 0 || y1 < 0 || x2 < 0 || y2 < 0 ||
+			static_cast<uint>(x1) > Map::MaxX() || static_cast<uint>(y1) > Map::MaxY() ||
+			static_cast<uint>(x2) > Map::MaxX() || static_cast<uint>(y2) > Map::MaxY()) {
+		return dump({{"ok", false}, {"error", "invalid tile"}, {"cost", 0}});
+	}
+
+	const TileIndex tile = TileXY(static_cast<uint>(x1), static_cast<uint>(y1));
+	const TileIndex end_in = TileXY(static_cast<uint>(x2), static_cast<uint>(y2));
+
+	/* Auto-snap (explicit_track = -1) reuses the same 8-direction rule the rail
+	 * build uses, giving the primary track and a sibling to retry for staircases. */
+	const SctRailDrag drag = SctResolveRailDrag(tile, end_in, -1);
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	if (remove != 0) {
+		CommandCost cost = Command<CMD_REMOVE_SIGNAL_TRACK>::Do(
+				DoCommandFlag::Execute, tile, drag.end, drag.track, false);
+		if (cost.Failed() && drag.alternate != INVALID_TRACK) {
+			cost = Command<CMD_REMOVE_SIGNAL_TRACK>::Do(
+					DoCommandFlag::Execute, tile, drag.end, drag.alternate, false);
+		}
+		return dump(SctCostResult(cost));
+	}
+
+	const SignalType st = (sigtype >= SIGTYPE_BLOCK && sigtype <= SIGTYPE_LAST)
+			? static_cast<SignalType>(sigtype) : SIGTYPE_BLOCK;
+	const uint8_t dens = static_cast<uint8_t>(std::clamp(density <= 0 ? 1 : density, 1, 20));
+
+	CommandCost cost = Command<CMD_BUILD_SIGNAL_TRACK>::Do(
+			DoCommandFlag::Execute, tile, drag.end, drag.track, st, SIG_ELECTRIC,
+			false, false, false, dens);
+	if (cost.Failed() && drag.alternate != INVALID_TRACK) {
+		cost = Command<CMD_BUILD_SIGNAL_TRACK>::Do(
+				DoCommandFlag::Execute, tile, drag.end, drag.alternate, st, SIG_ELECTRIC,
+				false, false, false, dens);
+	}
+	return dump(SctCostResult(cost));
+}
+
+/**
+ * Wave 26 — reorder an order within a vehicle's list (drag/drop). order_cmd.h
+ * CmdMoveOrder(flags, veh, moving_order, target_order).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_move_order(int veh, int from, int to)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const VehicleID vid{static_cast<uint32_t>(veh)};
+	if (!Vehicle::IsValidID(vid)) {
+		return dump({{"ok", false}, {"error", "invalid vehicle"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_MOVE_ORDER>::Do(
+			DoCommandFlag::Execute, vid,
+			static_cast<VehicleOrderID>(from), static_cast<VehicleOrderID>(to));
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 26 — append a conditional (skip-to) order to a vehicle's list. Mirrors the
+ * order GUI's insert path (order_gui.cpp:1170): a default-constructed Order with
+ * MakeConditional(skipTo), inserted at the end via order_cmd.h CmdInsertOrder. The
+ * condition variable/comparator/value default to what MakeConditional sets and are
+ * later edited through sct_modify_order (MOF_COND_VARIABLE/COMPARATOR/VALUE).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_add_conditional_order(int veh, int skip_to)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const Vehicle *v = Vehicle::GetIfValid(veh);
+	if (v == nullptr) {
+		return dump({{"ok", false}, {"error", "no vehicle"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	Order o{};
+	o.MakeConditional(static_cast<VehicleOrderID>(skip_to));
+
+	const VehicleOrderID sel_ord = v->GetNumOrders();
+	CommandCost cost = Command<CMD_INSERT_ORDER>::Do(
+			DoCommandFlag::Execute, VehicleID{static_cast<uint32_t>(veh)}, sel_ord, o);
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 26 — copy (share == 0) or share (share != 0) the source vehicle's order list
+ * onto the destination vehicle. order_cmd.h CmdCloneOrder(flags, CloneOptions, dst,
+ * src) with CO_SHARE / CO_COPY (order_type.h).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_clone_orders(int dst_veh, int src_veh, int share)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const VehicleID dst{static_cast<uint32_t>(dst_veh)};
+	const VehicleID src{static_cast<uint32_t>(src_veh)};
+	if (!Vehicle::IsValidID(dst) || !Vehicle::IsValidID(src)) {
+		return dump({{"ok", false}, {"error", "invalid vehicle"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_CLONE_ORDER>::Do(
+			DoCommandFlag::Execute, (share != 0) ? CO_SHARE : CO_COPY, dst, src);
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 26 — the vehicle ids sharing an order list with the given vehicle (walks the
+ * shared-order ring FirstShared()/NextShared(), order_base.h/vehicle_base.h). Always
+ * includes the vehicle itself; a single-element array means it shares with no one.
+ * @return JSON array of vehicle ids, or "[]" for an invalid id.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_shared_vehicles(int veh_id)
+{
+	static std::string buffer;
+
+	const Vehicle *v = Vehicle::GetIfValid(veh_id);
+	if (v == nullptr) {
+		buffer = "[]";
+		return buffer.c_str();
+	}
+
+	nlohmann::json arr = nlohmann::json::array();
+	for (const Vehicle *u = v->FirstShared(); u != nullptr; u = u->NextShared()) {
+		arr.push_back(static_cast<int>(u->index.base()));
+	}
+
+	buffer = arr.dump();
+	return buffer.c_str();
+}
+
+/**
+ * Wave 26 — the bridge specs valid for a span from (x1,y1) to (x2,y2). Iterates
+ * MAX_BRIDGES and keeps every spec CheckBridgeAvailability accepts for that length
+ * (bridge_gui.cpp:415-431). `name` is the spec's material string; `speed` its max
+ * speed (bridge km/h units); `maxLength` the max span; `price` the relative price
+ * multiplier the UI can label with. `transport` (0 rail, 1 road, 2 water) is accepted
+ * for forward-compat and does not change availability here.
+ * @return JSON array, or "[]" for off-map tiles.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_bridge_types(int x1, int y1, int x2, int y2, int transport)
+{
+	static std::string buffer;
+
+	(void)transport;
+
+	if (!SctInGame() || !Map::IsInitialized() ||
+			x1 < 0 || y1 < 0 || x2 < 0 || y2 < 0 ||
+			static_cast<uint>(x1) > Map::MaxX() || static_cast<uint>(y1) > Map::MaxY() ||
+			static_cast<uint>(x2) > Map::MaxX() || static_cast<uint>(y2) > Map::MaxY()) {
+		buffer = "[]";
+		return buffer.c_str();
+	}
+
+	const TileIndex t1 = TileXY(static_cast<uint>(x1), static_cast<uint>(y1));
+	const TileIndex t2 = TileXY(static_cast<uint>(x2), static_cast<uint>(y2));
+	const uint bridge_len = GetTunnelBridgeLength(t1, t2);
+
+	nlohmann::json arr = nlohmann::json::array();
+	for (BridgeType i = 0; i < MAX_BRIDGES; i++) {
+		if (CheckBridgeAvailability(i, bridge_len).Failed()) continue;
+		const BridgeSpec *spec = GetBridgeSpec(i);
+		arr.push_back({
+			{"id", static_cast<int>(i)},
+			{"name", GetString(spec->material)},
+			{"speed", spec->speed},
+			{"maxLength", spec->max_length},
+			{"price", spec->price},
+		});
+	}
+
+	buffer = arr.dump();
+	return buffer.c_str();
+}
+
+/**
+ * Wave 26 — start a new AI company, mirroring console ConStartAI
+ * (console_cmds.cpp:1446). Requires a normal game with a free company slot. An empty
+ * `name` starts a random AI; otherwise the next free AIConfig slot is configured with
+ * that AI (config->Change) before the company is created via CMD_COMPANY_CTRL
+ * (CCA_NEW_AI). A name that matches no installed AI is rejected.
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_start_ai(const char *name)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (_game_mode != GM_NORMAL) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+	if (Company::GetNumItems() >= MAX_COMPANIES || !AI::CanStartNew()) {
+		return dump({{"ok", false}, {"error", "no free company slots"}});
+	}
+
+	/* Find the next free company slot (same scan as ConStartAI). */
+	int n = 0;
+	for (const Company *c : Company::Iterate()) {
+		if (c->index != n) break;
+		n++;
+	}
+
+	AIConfig *config = AIConfig::GetConfig(static_cast<CompanyID>(static_cast<CompanyID::BaseType>(n)));
+	if (name != nullptr && name[0] != '\0') {
+		config->Change(name, -1, false);
+		if (!config->HasScript()) {
+			return dump({{"ok", false}, {"error", "AI not found"}});
+		}
+	}
+
+	Command<CMD_COMPANY_CTRL>::Do(
+			DoCommandFlag::Execute, CCA_NEW_AI, CompanyID::Invalid(), CRR_NONE, INVALID_CLIENT_ID);
+	return dump({{"ok", true}, {"error", std::string{}}});
+}
+
+/**
+ * Wave 26 — set (or clear) the Game Script used for new games. Mirrors the GS GUI /
+ * settings path: GameConfig::GetConfig(SSS_FORCE_NEWGAME)->Change(name)
+ * (settings.cpp:985-994). An empty `name` clears the newgame GS (Change(nullopt)). A
+ * name that matches no installed GS leaves the slot without a script. Takes effect on
+ * the next new game.
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_set_game_script(const char *name)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	GameConfig *config = GameConfig::GetConfig(GameConfig::SSS_FORCE_NEWGAME);
+	if (config == nullptr) {
+		return dump({{"ok", false}, {"error", "no game-script config"}});
+	}
+
+	if (name != nullptr && name[0] != '\0') {
+		config->Change(std::string_view{name});
+		if (!config->HasScript()) {
+			return dump({{"ok", false}, {"error", "game script not found"}});
+		}
+	} else {
+		config->Change(std::nullopt);
+	}
+	return dump({{"ok", true}, {"error", std::string{}}});
+}
+
+/**
+ * Wave 29 — describe the parameters of a currently-selected NewGRF. `grfid_hex` is the
+ * canonical 8-hex-char display grfid (as query('newgrfAvailable') emits); the GRF must
+ * already be in the new-game config (added via sct_newgrf_select). Mirrors the parameter
+ * window (newgrf_gui.cpp): one descriptor slot per `num_valid_params`. Slots with declared
+ * action-14 info (param_info[i]) expose that name/description/min/max/default; GRFs without
+ * declared info fall back to generic "Parameter N" slots (min 0, max 2147483647, default 0),
+ * exactly as the GUI's dummy parameter-info does. `max` is clamped to 2147483647 so consumers
+ * treating it as a signed 32-bit int stay safe. `values` is the raw current param array
+ * (config->param); entries beyond its length are implicitly 0.
+ * @return JSON `{params:[{index,name,description,min,max,defaultValue}], values:[…]}`, or
+ *         the literal JSON `null` when the GRF is not selected.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_newgrf_params(const char *grfid_hex)
+{
+	static std::string buffer;
+
+	const GRFConfig *config = SctFindNewgameGrf(grfid_hex);
+	if (config == nullptr) {
+		buffer = "null";
+		return buffer.c_str();
+	}
+
+	constexpr uint32_t MAX_CLAMP = 0x7fffffffu; // 2147483647: keep JSON ints signed-32-bit safe
+
+	nlohmann::json params = nlohmann::json::array();
+	const uint count = config->num_valid_params;
+	for (uint i = 0; i < count; i++) {
+		std::string name;
+		std::string desc;
+		uint32_t minv = 0;
+		uint32_t maxv = MAX_CLAMP;
+		uint32_t defv = 0;
+
+		if (i < config->param_info.size() && config->param_info[i].has_value()) {
+			const GRFParameterInfo &info = config->param_info[i].value();
+			if (auto n = GetGRFStringFromGRFText(info.name); n.has_value()) name = std::string(*n);
+			if (auto d = GetGRFStringFromGRFText(info.desc); d.has_value()) desc = std::string(*d);
+			minv = std::min<uint32_t>(info.min_value, MAX_CLAMP);
+			maxv = std::min<uint32_t>(info.max_value, MAX_CLAMP);
+			defv = std::min<uint32_t>(info.def_value, MAX_CLAMP);
+		}
+		if (name.empty()) name = fmt::format("Parameter {}", i + 1);
+
+		params.push_back({
+			{"index", static_cast<int>(i)},
+			{"name", name},
+			{"description", desc},
+			{"min", static_cast<int64_t>(minv)},
+			{"max", static_cast<int64_t>(maxv)},
+			{"defaultValue", static_cast<int64_t>(defv)},
+		});
+	}
+
+	nlohmann::json values = nlohmann::json::array();
+	for (uint32_t v : config->param) values.push_back(static_cast<int64_t>(v));
+
+	nlohmann::json j = {{"params", std::move(params)}, {"values", std::move(values)}};
+	buffer = j.dump();
+	return buffer.c_str();
+}
+
+/**
+ * Wave 29 — set one parameter of a currently-selected NewGRF in the new-game config.
+ * `grfid_hex` is the canonical display grfid; the GRF must already be selected. `index`
+ * must be < num_valid_params. Uses the GUI's exact mutation path: GRFConfig::SetValue on
+ * the declared GRFParameterInfo (which clamps to the param's range, resizes config->param
+ * as needed, and honours bit-packed sub-parameters); for slots without declared info a
+ * fresh dummy GRFParameterInfo(index) is used (min 0, max UINT32_MAX, 32-bit), mirroring
+ * newgrf_gui.cpp's GetDummyParameterInfo. Takes effect on the next new game (no rescan).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_newgrf_set_param(const char *grfid_hex, int index, int value)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	GRFConfig *config = SctFindNewgameGrf(grfid_hex);
+	if (config == nullptr) {
+		return dump({{"ok", false}, {"error", "grf not selected"}});
+	}
+	if (index < 0 || index >= static_cast<int>(config->num_valid_params)) {
+		return dump({{"ok", false}, {"error", "param index out of range"}});
+	}
+
+	const uint idx = static_cast<uint>(index);
+	if (idx < config->param_info.size() && config->param_info[idx].has_value()) {
+		config->SetValue(config->param_info[idx].value(), static_cast<uint32_t>(value));
+	} else {
+		GRFParameterInfo dummy(idx);
+		config->SetValue(dummy, static_cast<uint32_t>(value));
+	}
+	return dump({{"ok", true}, {"error", std::string{}}});
+}
+
+/**
+ * Wave 29 — start world generation from a heightmap PNG/BMP the app has already written
+ * into the Emscripten FS heightmap directory (HEIGHTMAP_DIR, i.e. scenario/heightmap).
+ * Mirrors the command-line -g path (openttd.cpp) + the GUI's StartGeneratingLandscape
+ * (genworld_gui.cpp): classify the file by extension via FiosGetHeightmapListCallback,
+ * verify it exists, read its dimensions (GetHeightmapDimensions) and pick fitting
+ * power-of-two map sizes (rotation-aware), stage it into _file_to_saveload, make the
+ * new-game settings live, reset the GRF config, then request SM_START_HEIGHTMAP so the
+ * next tick generates a normal game from the heightmap.
+ * @return {ok, error}. ok:false with a clear error when the file is missing or unreadable.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_start_heightmap(const char *filename)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (filename == nullptr || filename[0] == '\0') {
+		return dump({{"ok", false}, {"error", "empty filename"}});
+	}
+
+	const std::string name = filename;
+
+	/* Classify by extension exactly as openttd.cpp's -g path does. */
+	const size_t dot = name.find_last_of('.');
+	const std::string ext = (dot == std::string::npos) ? std::string{} : name.substr(dot);
+	const FiosType ft = std::get<0>(FiosGetHeightmapListCallback(SLO_LOAD, name, ext));
+	if (ft.abstract != FT_HEIGHTMAP) {
+		return dump({{"ok", false}, {"error", "not a heightmap file (.png/.bmp)"}});
+	}
+
+	/* The heightmap loader (heightmap.cpp) reads from HEIGHTMAP_DIR (scenario/heightmap). */
+	if (!FioCheckFileExists(name, HEIGHTMAP_DIR)) {
+		return dump({{"ok", false}, {"error", "heightmap file not found"}});
+	}
+
+	uint hx = 0;
+	uint hy = 0;
+	if (!GetHeightmapDimensions(ft.detailed, name, &hx, &hy) || hx == 0 || hy == 0) {
+		return dump({{"ok", false}, {"error", "could not read heightmap"}});
+	}
+
+	/* Pick the smallest power-of-two map that fits each dimension (as the GUI recommends),
+	 * clamped to the engine's map-size range and oriented like the current rotation. */
+	auto fit_bits = [](uint dim) -> uint {
+		uint bits = MIN_MAP_SIZE_BITS;
+		while ((1U << bits) < dim && bits < MAX_MAP_SIZE_BITS) bits++;
+		return bits;
+	};
+	uint bits_x = fit_bits(hx);
+	uint bits_y = fit_bits(hy);
+	if (_settings_newgame.game_creation.heightmap_rotation == HM_CLOCKWISE) std::swap(bits_x, bits_y);
+	_settings_newgame.game_creation.map_x = bits_x;
+	_settings_newgame.game_creation.map_y = bits_y;
+
+	/* Stage the file the same way _file_to_saveload.Set(...) does for the GUI/-g path. */
+	_file_to_saveload.name = name;
+	_file_to_saveload.SetMode(ft, SLO_LOAD);
+
+	/* Mirror genworld_gui.cpp StartGeneratingLandscape(GLWM_HEIGHTMAP) in a normal game. */
+	CloseAllNonVitalWindows();
+	ClearErrorMessages();
+	MakeNewgameSettingsLive();
+	ResetGRFConfig(true);
+	_switch_mode = SM_START_HEIGHTMAP;
+
+	return dump({{"ok", true}, {"error", std::string{}}});
+}
+
+/**
+ * Wave 29 — send a chat message in a network game (network_func.h). dest_type maps to
+ * DestType: 0 = broadcast (all), 1 = team (company `dest`), 2 = client (client id `dest`).
+ * The NetworkAction is NETWORK_ACTION_CHAT + dest_type, exactly as network_chat_gui.cpp's
+ * SendChat computes it. Networked games only.
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_chat(int dest_type, int dest, const char *msg)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!_networking) {
+		return dump({{"ok", false}, {"error", "not in a network game"}});
+	}
+	if (dest_type < 0 || dest_type > 2) {
+		return dump({{"ok", false}, {"error", "invalid dest_type"}});
+	}
+
+	const DestType type = static_cast<DestType>(dest_type);
+	const NetworkAction action = static_cast<NetworkAction>(NETWORK_ACTION_CHAT + dest_type);
+	NetworkClientSendChat(action, type, dest, msg == nullptr ? "" : msg);
+
+	return dump({{"ok", true}, {"error", std::string{}}});
+}
+
+/**
+ * Wave 29 — send an rcon command to the server (network_func.h). Client-side only: rcon
+ * is meaningless on a listen server and this emscripten build is always a client, but the
+ * guard is kept explicit. Networked games only.
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_rcon(const char *password, const char *cmd)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!_networking) {
+		return dump({{"ok", false}, {"error", "not in a network game"}});
+	}
+	if (_network_server) {
+		return dump({{"ok", false}, {"error", "rcon is a client action"}});
+	}
+
+	NetworkClientSendRcon(password == nullptr ? "" : password, cmd == nullptr ? "" : cmd);
+
+	return dump({{"ok", true}, {"error", std::string{}}});
 }
 
 } /* extern "C" */
