@@ -40,6 +40,9 @@
 #include "../../vehicle_cmd.h"
 #include "../../order_cmd.h"
 #include "../../order_type.h"
+#include "../../order_base.h"
+#include "../../timetable_cmd.h"
+#include "../../timer/timer_game_tick.h"
 #include "../../misc_cmd.h"
 #include "../../landscape_cmd.h"
 #include "../../terraform_cmd.h"
@@ -382,6 +385,33 @@ static nlohmann::json SctQueryEngines()
 	return arr;
 }
 
+static nlohmann::json SctQueryIndustryTypes()
+{
+	/* Wave 14 — buildable industry types. Iterate every IndustrySpec slot
+	 * (industry_type.h NUM_INDUSTRYTYPES) and emit only enabled specs (a NewGRF
+	 * can disable slots). cost is spec->GetConstructionCost(); prospectable is
+	 * cheaply read from spec->prospecting_chance (industrytype.h:107, non-zero
+	 * means the deity-prospect path can place it). */
+	nlohmann::json arr = nlohmann::json::array();
+	if (!SctInGame()) return arr;
+
+	for (IndustryType it = 0; it < NUM_INDUSTRYTYPES; it++) {
+		const IndustrySpec *spec = GetIndustrySpec(it);
+		if (spec == nullptr || !spec->enabled) continue;
+
+		nlohmann::json entry = {
+			{"id", static_cast<int>(it)},
+			{"cost", static_cast<int64_t>(spec->GetConstructionCost())},
+			{"prospectable", spec->prospecting_chance != 0},
+		};
+		if (spec->name != STR_NULL && spec->name != INVALID_STRING_ID) {
+			entry["name"] = GetString(spec->name);
+		}
+		arr.push_back(std::move(entry));
+	}
+	return arr;
+}
+
 static nlohmann::json SctQueryNews()
 {
 	nlohmann::json arr = nlohmann::json::array();
@@ -567,7 +597,7 @@ static void SctLevelFootprint(TileIndex origin, int width, int height)
 /**
  * Query entity data for the external UI.
  * @param kind Null-terminated query kind (towns, industries, stations, vehicles, groups,
- *             financeDetail, engines, news).
+ *             financeDetail, engines, news, cargos, companyEconomy, industryTypes).
  * @return Pointer to a static JSON string buffer (valid until the next call to this or sct_get_state).
  */
 const char *EMSCRIPTEN_KEEPALIVE sct_query(const char *kind)
@@ -597,6 +627,8 @@ const char *EMSCRIPTEN_KEEPALIVE sct_query(const char *kind)
 		j = SctQueryCargos();
 	} else if (std::strcmp(kind, "companyEconomy") == 0) {
 		j = SctQueryCompanyEconomy();
+	} else if (std::strcmp(kind, "industryTypes") == 0) {
+		j = SctQueryIndustryTypes();
 	} else {
 		j = {{"error", "unknown kind"}};
 	}
@@ -1200,10 +1232,15 @@ const char *EMSCRIPTEN_KEEPALIVE sct_add_order(int vehicle_id, const char *kind,
 }
 
 /**
- * Read-back of a vehicle's order list (Wave 4).
+ * Read-back of a vehicle's order list (Wave 4; timetable fields added Wave 14).
  * @return JSON array of orders, or the literal string "null" if vehicle is invalid.
- * Schema: [{"index", "type", "dest", "nonstop", "load", "unload"}, ...]
+ * Schema: [{"index", "type", "dest", "nonstop", "load", "unload",
+ *           "waitTime", "travelTime", "timetableStarted"}, ...]
  * type is "station"|"depot"|"waypoint"|"other"; dest is -1 for "other".
+ * waitTime / travelTime are timetabled ticks for the order (order_base.h
+ * GetTimetabledWait/GetTimetabledTravel; 0 when that leg is not timetabled).
+ * timetableStarted (base_consist.h VehicleFlag::TimetableStarted) is the same
+ * vehicle-level bool repeated on every entry so the array shape is preserved.
  */
 const char *EMSCRIPTEN_KEEPALIVE sct_vehicle_orders(int vehicle_id)
 {
@@ -1214,6 +1251,8 @@ const char *EMSCRIPTEN_KEEPALIVE sct_vehicle_orders(int vehicle_id)
 		buffer = "null";
 		return buffer.c_str();
 	}
+
+	const bool timetable_started = v->vehicle_flags.Test(VehicleFlag::TimetableStarted);
 
 	nlohmann::json arr = nlohmann::json::array();
 	int index = 0;
@@ -1244,6 +1283,9 @@ const char *EMSCRIPTEN_KEEPALIVE sct_vehicle_orders(int vehicle_id)
 			{"nonstop", static_cast<int>(o.GetNonStopType().base())},
 			{"load", static_cast<int>(o.GetLoadType())},
 			{"unload", static_cast<int>(o.GetUnloadType())},
+			{"waitTime", static_cast<int>(o.GetTimetabledWait())},
+			{"travelTime", static_cast<int>(o.GetTimetabledTravel())},
+			{"timetableStarted", timetable_started},
 		});
 		++index;
 	}
@@ -2049,6 +2091,118 @@ const char *EMSCRIPTEN_KEEPALIVE sct_scroll_to_vehicle(int vehicle_id)
 
 	bool ok = ScrollMainWindowTo(v->x_pos, v->y_pos, v->z_pos, true);
 	return dump({{"ok", ok}});
+}
+
+/**
+ * Wave 14 — set an order's timetabled wait (field 0) or travel (field 1) time.
+ * field maps to ModifyTimetableFlags (order_type.h:186): 0 → MTF_WAIT_TIME,
+ * 1 → MTF_TRAVEL_TIME. ticks is clamped to the uint16_t data field. Setting 0
+ * clears the timetabled value for that leg. timetable_cmd.h:18
+ * CmdChangeTimetable(veh, order_number, mtf, data).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_timetable(int vehicle_id, int order_index, int field, int ticks)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const VehicleID vid{static_cast<uint32_t>(vehicle_id)};
+	if (!Vehicle::IsValidID(vid)) {
+		return dump({{"ok", false}, {"error", "invalid vehicle"}});
+	}
+
+	ModifyTimetableFlags mtf;
+	if (field == 0) {
+		mtf = MTF_WAIT_TIME;
+	} else if (field == 1) {
+		mtf = MTF_TRAVEL_TIME;
+	} else {
+		return dump({{"ok", false}, {"error", "invalid field"}});
+	}
+
+	const uint16_t data = static_cast<uint16_t>(std::clamp(ticks, 0, 0xFFFF));
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_CHANGE_TIMETABLE>::Do(
+			DoCommandFlag::Execute, vid, static_cast<VehicleOrderID>(order_index), mtf, data);
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 14 — toggle autofill of a vehicle's timetable. on != 0 enables autofill;
+ * preserve-wait-time is fixed false. timetable_cmd.h:21
+ * CmdAutofillTimetable(veh, autofill, preserve_wait_time).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_autofill_timetable(int vehicle_id, int on)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const VehicleID vid{static_cast<uint32_t>(vehicle_id)};
+	if (!Vehicle::IsValidID(vid)) {
+		return dump({{"ok", false}, {"error", "invalid vehicle"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_AUTOFILL_TIMETABLE>::Do(
+			DoCommandFlag::Execute, vid, on != 0, false);
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 14 — set the timetable start to ticksFromNow ticks from the current tick.
+ * start_tick = TimerGameTick::counter + ticksFromNow (timer_game_tick.h:60), so a
+ * negative offset starts it in the past (immediately). timetable_all is false —
+ * this vehicle only. timetable_cmd.h:22
+ * CmdSetTimetableStart(veh_id, timetable_all, start_tick).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_timetable_start(int vehicle_id, int ticks_from_now)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const VehicleID vid{static_cast<uint32_t>(vehicle_id)};
+	if (!Vehicle::IsValidID(vid)) {
+		return dump({{"ok", false}, {"error", "invalid vehicle"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	const int64_t base_tick = static_cast<int64_t>(TimerGameTick::counter);
+	const int64_t target = std::max<int64_t>(0, base_tick + ticks_from_now);
+	const TimerGameTick::TickCounter start_tick = static_cast<TimerGameTick::TickCounter>(target);
+
+	CommandCost cost = Command<CMD_SET_TIMETABLE_START>::Do(
+			DoCommandFlag::Execute, vid, false, start_tick);
+	return dump(SctOkResult(cost));
 }
 
 /**

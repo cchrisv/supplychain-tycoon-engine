@@ -37,6 +37,9 @@ Module.sct = (function() {
     var _fundIndustry = null;
     var _townAction = null;
     var _scrollToVehicle = null;
+    var _timetable = null;
+    var _autofillTimetable = null;
+    var _timetableStart = null;
     var _setNativeClick = null;
     return {
         exec: function(cmd) {
@@ -176,6 +179,18 @@ Module.sct = (function() {
         scrollToVehicle: function(vehicleId) {
             if (!_scrollToVehicle) _scrollToVehicle = Module.cwrap('sct_scroll_to_vehicle', 'string', ['number']);
             return JSON.parse(_scrollToVehicle(vehicleId|0));
+        },
+        timetable: function(vehicleId, orderIndex, field, ticks) {
+            if (!_timetable) _timetable = Module.cwrap('sct_timetable', 'string', ['number', 'number', 'number', 'number']);
+            return JSON.parse(_timetable(vehicleId|0, orderIndex|0, field|0, ticks|0));
+        },
+        autofillTimetable: function(vehicleId, on) {
+            if (!_autofillTimetable) _autofillTimetable = Module.cwrap('sct_autofill_timetable', 'string', ['number', 'number']);
+            return JSON.parse(_autofillTimetable(vehicleId|0, on ? 1 : 0));
+        },
+        timetableStart: function(vehicleId, ticksFromNow) {
+            if (!_timetableStart) _timetableStart = Module.cwrap('sct_timetable_start', 'string', ['number', 'number']);
+            return JSON.parse(_timetableStart(vehicleId|0, ticksFromNow|0));
         },
         setNativeClick: function(on) {
             if (!_setNativeClick) _setNativeClick = Module.cwrap('sct_set_native_click', null, ['number']);
