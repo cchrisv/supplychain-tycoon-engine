@@ -1,4 +1,24 @@
-Module.arguments.push('-mnull', '-snull', '-vsdl');
+/* Music stays null (the app ships its own soundtrack player); sound effects
+ * run through SDL's emscripten audio. */
+Module.arguments.push('-mnull', '-ssdl', '-vsdl');
+
+/* Browsers keep the AudioContext suspended until a user gesture; resume the
+ * SDL audio context on the first input so effects actually play. */
+(function () {
+    var resumed = false;
+    function resumeAudio() {
+        if (resumed) return;
+        var ctx = Module.SDL2 && Module.SDL2.audioContext;
+        if (ctx && ctx.state === 'suspended') ctx.resume();
+        if (ctx && ctx.state !== 'suspended') {
+            resumed = true;
+            window.removeEventListener('pointerdown', resumeAudio, true);
+            window.removeEventListener('keydown', resumeAudio, true);
+        }
+    }
+    window.addEventListener('pointerdown', resumeAudio, true);
+    window.addEventListener('keydown', resumeAudio, true);
+})();
 
 /* Supplychain Tycoon external-UI bridge.
  * cwrap must not run before the runtime is ready; wrap lazily on first call. */
