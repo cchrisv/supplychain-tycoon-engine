@@ -27,6 +27,16 @@ Module.sct = (function() {
     var _scrollToTile = null;
     var _tileInfo = null;
     var _renameStation = null;
+    var _autoreplace = null;
+    var _enginePreview = null;
+    var _serviceInterval = null;
+    var _renameTown = null;
+    var _renameWaypoint = null;
+    var _sign = null;
+    var _foundTown = null;
+    var _fundIndustry = null;
+    var _townAction = null;
+    var _scrollToVehicle = null;
     var _setNativeClick = null;
     return {
         exec: function(cmd) {
@@ -126,6 +136,46 @@ Module.sct = (function() {
         renameStation: function(stationId, name) {
             if (!_renameStation) _renameStation = Module.cwrap('sct_rename_station', 'string', ['number', 'string']);
             return JSON.parse(_renameStation(stationId|0, name == null ? '' : String(name)));
+        },
+        autoreplace: function(groupId, fromEngine, toEngine, replaceWhenOld) {
+            if (!_autoreplace) _autoreplace = Module.cwrap('sct_autoreplace', 'string', ['number', 'number', 'number', 'number']);
+            return JSON.parse(_autoreplace(groupId|0, fromEngine|0, toEngine|0, replaceWhenOld ? 1 : 0));
+        },
+        enginePreview: function(engineId, accept) {
+            if (!_enginePreview) _enginePreview = Module.cwrap('sct_engine_preview', 'string', ['number', 'number']);
+            return JSON.parse(_enginePreview(engineId|0, accept ? 1 : 0));
+        },
+        serviceInterval: function(vehicleId, interval, isPercent) {
+            if (!_serviceInterval) _serviceInterval = Module.cwrap('sct_service_interval', 'string', ['number', 'number', 'number']);
+            return JSON.parse(_serviceInterval(vehicleId|0, interval|0, isPercent ? 1 : 0));
+        },
+        renameTown: function(townId, name) {
+            if (!_renameTown) _renameTown = Module.cwrap('sct_rename_town', 'string', ['number', 'string']);
+            return JSON.parse(_renameTown(townId|0, name == null ? '' : String(name)));
+        },
+        renameWaypoint: function(waypointId, name) {
+            if (!_renameWaypoint) _renameWaypoint = Module.cwrap('sct_rename_waypoint', 'string', ['number', 'string']);
+            return JSON.parse(_renameWaypoint(waypointId|0, name == null ? '' : String(name)));
+        },
+        sign: function(cmdKind, tileOrId, name) {
+            if (!_sign) _sign = Module.cwrap('sct_sign', 'string', ['number', 'number', 'string']);
+            return JSON.parse(_sign(cmdKind|0, tileOrId|0, name == null ? '' : String(name)));
+        },
+        foundTown: function(tile, size, cityLayout) {
+            if (!_foundTown) _foundTown = Module.cwrap('sct_found_town', 'string', ['number', 'number', 'number']);
+            return JSON.parse(_foundTown(tile|0, size|0, cityLayout === undefined ? 0 : cityLayout|0));
+        },
+        fundIndustry: function(tile, industryType, prospect) {
+            if (!_fundIndustry) _fundIndustry = Module.cwrap('sct_fund_industry', 'string', ['number', 'number', 'number']);
+            return JSON.parse(_fundIndustry(tile|0, industryType|0, prospect ? 1 : 0));
+        },
+        townAction: function(townId, action) {
+            if (!_townAction) _townAction = Module.cwrap('sct_town_action', 'string', ['number', 'number']);
+            return JSON.parse(_townAction(townId|0, action|0));
+        },
+        scrollToVehicle: function(vehicleId) {
+            if (!_scrollToVehicle) _scrollToVehicle = Module.cwrap('sct_scroll_to_vehicle', 'string', ['number']);
+            return JSON.parse(_scrollToVehicle(vehicleId|0));
         },
         setNativeClick: function(on) {
             if (!_setNativeClick) _setNativeClick = Module.cwrap('sct_set_native_click', null, ['number']);

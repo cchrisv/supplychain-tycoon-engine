@@ -43,6 +43,21 @@
 #include "../../misc_cmd.h"
 #include "../../landscape_cmd.h"
 #include "../../terraform_cmd.h"
+#include "../../tunnelbridge_cmd.h"
+#include "../../tunnelbridge.h"
+#include "../../bridge.h"
+#include "../../transport_type.h"
+#include "../../waypoint_cmd.h"
+#include "../../autoreplace_cmd.h"
+#include "../../engine_cmd.h"
+#include "../../town_cmd.h"
+#include "../../signs_cmd.h"
+#include "../../industry_cmd.h"
+#include "../../group_type.h"
+#include "../../engine_type.h"
+#include "../../townname_func.h"
+#include "../../settings_type.h"
+#include "../../core/random_func.hpp"
 #include "../../newgrf_station.h"
 #include "../../rail.h"
 #include "../../road_func.h"
@@ -389,6 +404,30 @@ static nlohmann::json SctQueryNews()
 	return arr;
 }
 
+static nlohmann::json SctQueryCompanyEconomy()
+{
+	nlohmann::json arr = nlohmann::json::array();
+	if (!SctInGame()) return arr;
+
+	const Company *c = Company::GetIfValid(_local_company);
+	if (c == nullptr) return arr;
+
+	/* company_base.h: old_economy[0] is the most recent quarter; num_valid_stat_ent
+	 * counts the filled entries. Emit oldest -> newest for a natural history chart. */
+	const int n = std::min<int>(c->num_valid_stat_ent, static_cast<int>(c->old_economy.size()));
+	for (int i = n - 1; i >= 0; i--) {
+		const CompanyEconomyEntry &e = c->old_economy[i];
+		arr.push_back({
+			{"income", static_cast<int64_t>(e.income)},
+			{"expenses", static_cast<int64_t>(e.expenses)},
+			{"companyValue", static_cast<int64_t>(e.company_value)},
+			{"deliveredCargo", static_cast<int64_t>(e.delivered_cargo.GetSum<uint64_t>())},
+			{"performance", e.performance_history},
+		});
+	}
+	return arr;
+}
+
 /* ---- Write-bridge helpers (build / place / vehicle commands) ---- */
 
 /** Default railtype for build commands when p1 == 0 (0 = auto-pick first available). */
@@ -556,6 +595,8 @@ const char *EMSCRIPTEN_KEEPALIVE sct_query(const char *kind)
 		j = SctQueryNews();
 	} else if (std::strcmp(kind, "cargos") == 0) {
 		j = SctQueryCargos();
+	} else if (std::strcmp(kind, "companyEconomy") == 0) {
+		j = SctQueryCompanyEconomy();
 	} else {
 		j = {{"error", "unknown kind"}};
 	}
@@ -917,6 +958,84 @@ const char *EMSCRIPTEN_KEEPALIVE sct_build(const char *action, int a, int b, int
 		nlohmann::json j = SctCostResult(cost);
 		if (cost.Succeeded()) j["cost"] = static_cast<int64_t>(std::get<1>(res));
 		return dump(j);
+	}
+
+	if (std::strcmp(action, "bridge") == 0) {
+		/* Wave 13 — tunnelbridge_cmd.h CmdBuildBridge(end, start, transport, bridge_type,
+		 * road_rail_type). a=end tile, b=start tile; p1 transport (0 rail, 1 road);
+		 * p2 explicit bridge type or <=0 = auto-pick the cheapest valid spec for the span
+		 * (bridge_gui.cpp:415-431). road_rail_type is the stashed rail/road type. */
+		const TransportType tt = (p1 == 1) ? TRANSPORT_ROAD : TRANSPORT_RAIL;
+		const uint8_t rr_type = (tt == TRANSPORT_RAIL)
+				? static_cast<uint8_t>(SctResolveRailType(0))
+				: static_cast<uint8_t>(SctResolveRoadType(0));
+		if (!IsValidTile(tile_a) || !IsValidTile(tile_b)) {
+			return dump({{"ok", false}, {"error", "invalid tile"}, {"cost", 0}});
+		}
+		/* bridge.h/tunnelbridge.h: length is the number of tiles spanned between the
+		 * two ramps (exclusive), same value CheckBridgeAvailability expects. */
+		const uint bridge_len = GetTunnelBridgeLength(tile_b, tile_a);
+		BridgeType bt = 0;
+		if (p2 > 0 && static_cast<uint>(p2) < MAX_BRIDGES) {
+			bt = static_cast<BridgeType>(p2);
+		} else {
+			bool found = false;
+			uint16_t best_price = 0;
+			for (BridgeType cand = 0; cand < MAX_BRIDGES; cand++) {
+				if (CheckBridgeAvailability(cand, bridge_len).Failed()) continue;
+				const uint16_t price = GetBridgeSpec(cand)->price;
+				if (!found || price < best_price) {
+					best_price = price;
+					bt = cand;
+					found = true;
+				}
+			}
+			if (!found) {
+				return dump({{"ok", false}, {"error", "no bridge available"}, {"cost", 0}});
+			}
+		}
+		CommandCost cost = Command<CMD_BUILD_BRIDGE>::Do(
+				DoCommandFlag::Execute, tile_a, tile_b, tt, bt, rr_type);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "tunnel") == 0) {
+		/* Wave 13 — tunnelbridge_cmd.h CmdBuildTunnel(start, transport, road_rail_type).
+		 * a=start tile; p1 transport (0 rail, 1 road). The engine bores toward the facing
+		 * hillside and picks the exit itself. */
+		const TransportType tt = (p1 == 1) ? TRANSPORT_ROAD : TRANSPORT_RAIL;
+		const uint8_t rr_type = (tt == TRANSPORT_RAIL)
+				? static_cast<uint8_t>(SctResolveRailType(0))
+				: static_cast<uint8_t>(SctResolveRoadType(0));
+		CommandCost cost = Command<CMD_BUILD_TUNNEL>::Do(
+				DoCommandFlag::Execute, tile_a, tt, rr_type);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "rail_waypoint") == 0) {
+		/* Wave 13 — waypoint_cmd.h CmdBuildRailWaypoint(tile, axis, w, h, class, index,
+		 * join, adjacent); a=tile, axis from p1, 1x1 default (rail_gui.cpp:183). */
+		const Axis axis = SctResolveAxis(p1);
+		SctLevelFootprint(tile_a, 1, 1); /* flatten so it never fails on slopes */
+		CommandCost cost = Command<CMD_BUILD_RAIL_WAYPOINT>::Do(
+				DoCommandFlag::Execute, tile_a, axis,
+				static_cast<uint8_t>(1), static_cast<uint8_t>(1),
+				STAT_CLASS_WAYP, static_cast<uint16_t>(0), StationID::Invalid(), false);
+		return dump(SctCostResult(cost));
+	}
+
+	if (std::strcmp(action, "convert_rail") == 0) {
+		/* Wave 13 — rail_cmd.h CmdConvertRail(end, area_start, totype, diagonal)
+		 * (rail_gui.cpp:759). a..b area, to the stashed / p1 railtype. Single tile when
+		 * b is unset (a==b). */
+		const RailType rt = SctResolveRailType(p1);
+		if (!IsValidTile(tile_a)) {
+			return dump({{"ok", false}, {"error", "invalid tile"}, {"cost", 0}});
+		}
+		const TileIndex end = (a != b && IsValidTile(tile_b)) ? tile_b : tile_a;
+		CommandCost cost = Command<CMD_CONVERT_RAIL>::Do(
+				DoCommandFlag::Execute, end, tile_a, rt, false);
+		return dump(SctCostResult(cost));
 	}
 
 	return dump({{"ok", false}, {"error", "unknown action"}, {"cost", 0}});
@@ -1583,6 +1702,353 @@ const char *EMSCRIPTEN_KEEPALIVE sct_rename_station(int station_id, const char *
 			sid,
 			std::string{name == nullptr ? "" : name});
 	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 13 — configure engine autoreplace for a group.
+ * autoreplace_cmd.h CmdSetAutoReplace(id_g, old_engine, new_engine, when_old).
+ * groupId < 0 → ALL_GROUP (all vehicles). toEngine < 0 → EngineID::Invalid(),
+ * which stops replacing fromEngine. replaceWhenOld != 0 → only replace when old.
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_autoreplace(int group_id, int from_engine, int to_engine, int replace_when_old)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	const GroupID gid = (group_id < 0) ? ALL_GROUP : GroupID{static_cast<uint16_t>(group_id)};
+	const EngineID from{static_cast<uint16_t>(from_engine)};
+	const EngineID to = (to_engine < 0)
+			? EngineID::Invalid()
+			: EngineID{static_cast<uint16_t>(to_engine)};
+
+	CommandCost cost = Command<CMD_SET_AUTOREPLACE>::Do(
+			DoCommandFlag::Execute, gid, from, to, replace_when_old != 0);
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 13 — accept an engine's introductory preview offer.
+ * accept != 0 → engine_cmd.h CmdWantEnginePreview(engineId); accept == 0 is a
+ * decline, which is a pure no-op (the offer simply lapses).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_engine_preview(int engine_id, int accept)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+	if (accept == 0) {
+		return dump({{"ok", true}, {"error", std::string{}}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_WANT_ENGINE_PREVIEW>::Do(
+			DoCommandFlag::Execute, EngineID{static_cast<uint16_t>(engine_id)});
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 13 — set a vehicle's servicing interval.
+ * vehicle_cmd.h CmdChangeServiceInt(veh_id, serv_int, is_custom, is_percent).
+ * Always a custom interval (is_custom=true); isPercent != 0 treats the value as a
+ * reliability percentage rather than a day count (vehicle_gui.cpp:2780).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_service_interval(int vehicle_id, int interval, int is_percent)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const VehicleID vid{static_cast<uint32_t>(vehicle_id)};
+	if (!Vehicle::IsValidID(vid)) {
+		return dump({{"ok", false}, {"error", "invalid vehicle"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_CHANGE_SERVICE_INT>::Do(
+			DoCommandFlag::Execute, vid, static_cast<uint16_t>(interval),
+			true, is_percent != 0);
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 13 — rename a town. Empty name resets to the default.
+ * town_cmd.h CmdRenameTown(town_id, text).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_rename_town(int town_id, const char *name)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const TownID tid{static_cast<uint16_t>(town_id)};
+	if (!Town::IsValidID(tid)) {
+		return dump({{"ok", false}, {"error", "invalid town"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_RENAME_TOWN>::Do(
+			DoCommandFlag::Execute, tid, std::string{name == nullptr ? "" : name});
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 13 — rename a waypoint. Waypoints live in the station pool, so the id is a
+ * StationID. Empty name resets to the default. waypoint_cmd.h CmdRenameWaypoint.
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_rename_waypoint(int waypoint_id, const char *name)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_RENAME_WAYPOINT>::Do(
+			DoCommandFlag::Execute, StationID{static_cast<uint16_t>(waypoint_id)},
+			std::string{name == nullptr ? "" : name});
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 13 — sign management. cmdKind: 0 place a sign at tile `tileOrId` with `name`
+ * (signs_cmd.h CmdPlaceSign, returns the new SignID); 1 rename sign `tileOrId` to
+ * `name` (CmdRenameSign); 2 delete sign `tileOrId` (CmdRenameSign with an empty
+ * string — signs_cmd.cpp:85 treats an empty name as delete). Signs are placed as
+ * the local company so the company can later edit/delete them (CompanyCanEditSign).
+ * @return {ok, error, id?}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_sign(int cmd_kind, int tile_or_id, const char *name)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	if (cmd_kind == 0) {
+		auto res = Command<CMD_PLACE_SIGN>::Do(
+				DoCommandFlag::Execute, TileIndex{static_cast<uint32_t>(tile_or_id)},
+				std::string{name == nullptr ? "" : name});
+		const CommandCost &cost = std::get<0>(res);
+		const SignID sid = std::get<1>(res);
+		const bool ok = cost.Succeeded() && sid != SignID::Invalid();
+		return dump({
+			{"ok", ok},
+			{"error", ok ? std::string{} : SctErrorFromCost(cost)},
+			{"id", ok ? static_cast<int>(sid.base()) : -1},
+		});
+	}
+
+	/* Rename (cmd_kind 1) or delete (cmd_kind 2 → empty name). */
+	const std::string text = (cmd_kind == 2) ? std::string{} : std::string{name == nullptr ? "" : name};
+	CommandCost cost = Command<CMD_RENAME_SIGN>::Do(
+			DoCommandFlag::Execute, SignID{static_cast<uint16_t>(tile_or_id)}, text);
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 13 — found a new town at `tile`. size 0 small / 1 medium / 2 large. The town
+ * uses the game's configured layout (town_cmd.h CmdFoundTown) and an auto-generated
+ * unique name. Runs as the local company (the in-game "Found new town" path), so it
+ * obeys the economy.found_town setting — large towns and random placement are only
+ * allowed when that setting permits (else the command returns a surfaced error).
+ * @return {ok, error, id?, cost?}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_found_town(int tile, int size, int city_layout)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}, {"id", -1}, {"cost", 0}});
+	}
+
+	const TileIndex t{static_cast<uint32_t>(tile)};
+	if (!IsValidTile(t)) {
+		return dump({{"ok", false}, {"error", "invalid tile"}, {"id", -1}, {"cost", 0}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	const TownSize ts = (size >= 0 && size < TSZ_END) ? static_cast<TownSize>(size) : TSZ_SMALL;
+	/* Use the configured layout so the player-founding layout check passes; city_layout
+	 * is accepted for forward-compat but the game setting governs the actual road grid. */
+	(void)city_layout;
+	const TownLayout layout = _settings_game.economy.town_layout;
+
+	/* Empty text → CmdFoundTown needs a unique auto name in townnameparts. */
+	uint32_t townnameparts = 0;
+	(void)GenerateTownName(_interactive_random, &townnameparts);
+
+	auto res = Command<CMD_FOUND_TOWN>::Do(
+			DoCommandFlag::Execute, t, ts, false, layout, false, townnameparts, std::string{});
+	const CommandCost &cost = std::get<0>(res);
+	const TownID tid = std::get<2>(res);
+	const bool ok = cost.Succeeded();
+	return dump({
+		{"ok", ok},
+		{"error", ok ? std::string{} : SctErrorFromCost(cost)},
+		{"id", ok ? static_cast<int>(tid.base()) : -1},
+		{"cost", static_cast<int64_t>(std::get<1>(res))},
+	});
+}
+
+/**
+ * Wave 13 — build/fund an industry. prospect != 0 uses the prospecting variant
+ * (industry_cmd.h CmdBuildIndustry, run as OWNER_DEITY so the deity-prospect path
+ * places it somewhere on the map — `tile` is ignored); prospect == 0 funds the
+ * industry at `tile` as the local company (fund=true, matching the GUI Fund button).
+ * @return {ok, error, cost?}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_fund_industry(int tile, int industry_type, int prospect)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}, {"cost", 0}});
+	}
+
+	const IndustryType it = static_cast<IndustryType>(industry_type);
+	const uint32_t seed = _interactive_random.Next();
+
+	if (prospect != 0) {
+		/* Deity prospecting (industry_cmd.cpp:2089): fund=false as OWNER_DEITY, tile
+		 * ignored. CMD_BUILD_INDUSTRY carries CommandFlag::Deity so this is allowed. */
+		AutoRestoreBackup backup(_current_company, OWNER_DEITY);
+		CommandCost cost = Command<CMD_BUILD_INDUSTRY>::Do(
+				DoCommandFlag::Execute, TileIndex{}, it,
+				static_cast<uint32_t>(0), false, seed);
+		return dump(SctCostResult(cost));
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+	CommandCost cost = Command<CMD_BUILD_INDUSTRY>::Do(
+			DoCommandFlag::Execute, TileIndex{static_cast<uint32_t>(tile)}, it,
+			static_cast<uint32_t>(0), true, seed);
+	return dump(SctCostResult(cost));
+}
+
+/**
+ * Wave 13 — perform a local-authority action on a town (town_cmd.h CmdDoTownAction).
+ * action 0-7: 0 small ad, 1 medium ad, 2 large ad, 3 road rebuild, 4 statue,
+ * 5 fund buildings, 6 buy exclusive rights, 7 bribe (town.h TownAction).
+ * @return {ok, error}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_town_action(int town_id, int action)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctCanBuild()) {
+		return dump({{"ok", false}, {"error", "not in game"}});
+	}
+
+	const TownID tid{static_cast<uint16_t>(town_id)};
+	if (!Town::IsValidID(tid)) {
+		return dump({{"ok", false}, {"error", "invalid town"}});
+	}
+	if (action < 0 || action >= static_cast<int>(TownAction::End)) {
+		return dump({{"ok", false}, {"error", "invalid action"}});
+	}
+
+	AutoRestoreBackup backup(_current_company, _local_company);
+
+	CommandCost cost = Command<CMD_DO_TOWN_ACTION>::Do(
+			DoCommandFlag::Execute, tid, static_cast<TownAction>(action));
+	return dump(SctOkResult(cost));
+}
+
+/**
+ * Wave 13 — centre the main viewport on a vehicle's current position (not a Command).
+ * Vehicle::GetIfValid → ScrollMainWindowTo(x_pos, y_pos, z_pos) (viewport_func.h:80).
+ * @return {ok}.
+ */
+const char *EMSCRIPTEN_KEEPALIVE sct_scroll_to_vehicle(int vehicle_id)
+{
+	static std::string buffer;
+
+	auto dump = [&](const nlohmann::json &j) -> const char * {
+		buffer = j.dump();
+		return buffer.c_str();
+	};
+
+	if (!SctInGame() || !Map::IsInitialized()) {
+		return dump({{"ok", false}});
+	}
+
+	const Vehicle *v = Vehicle::GetIfValid(vehicle_id);
+	if (v == nullptr) {
+		return dump({{"ok", false}});
+	}
+
+	bool ok = ScrollMainWindowTo(v->x_pos, v->y_pos, v->z_pos, true);
+	return dump({{"ok", ok}});
 }
 
 /**
